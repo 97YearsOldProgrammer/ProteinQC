@@ -1,0 +1,42 @@
+"""Download CaLM pretrained weights from HuggingFace (multimolecule/calm).
+
+Uses huggingface_hub only — no transformers, no multimolecule library.
+Downloads model.safetensors, config.json, and vocab.txt into models/calm/.
+"""
+
+from pathlib import Path
+
+from huggingface_hub import hf_hub_download
+
+REPO_ID = "multimolecule/calm"
+LOCAL_DIR = Path(__file__).resolve().parent.parent / "models" / "calm"
+FILES = ["model.safetensors", "config.json", "vocab.txt"]
+
+
+def download_calm() -> None:
+    LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+
+    for filename in FILES:
+        dest = LOCAL_DIR / filename
+        if dest.exists():
+            size_mb = dest.stat().st_size / (1024 * 1024)
+            print(f"  [skip] {filename} already exists ({size_mb:.1f} MB)")
+            continue
+
+        print(f"  Downloading {filename} ...")
+        hf_hub_download(
+            repo_id=REPO_ID,
+            filename=filename,
+            local_dir=str(LOCAL_DIR),
+        )
+        size_mb = dest.stat().st_size / (1024 * 1024)
+        print(f"  [done] {filename} ({size_mb:.1f} MB)")
+
+    print("\nAll files in models/calm/:")
+    for f in sorted(LOCAL_DIR.iterdir()):
+        size_mb = f.stat().st_size / (1024 * 1024)
+        print(f"  {f.name:30s} {size_mb:>8.2f} MB")
+
+
+if __name__ == "__main__":
+    download_calm()

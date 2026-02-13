@@ -1,0 +1,100 @@
+"""Load CaLM weights from safetensors and print full weight inventory.
+
+Pure PyTorch + safetensors — no transformers, no multimolecule library.
+Prints every weight name, shape, dtype, and parameter count.
+Verifies architecture: 12 layers, 768 hidden, 12 heads, 3072 FFN.
+"""
+
+import json
+from pathlib import Path
+
+import torch
+from safetensors.torch import load_file
+
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models" / "calm"
+SAFETENSORS_PATH = MODEL_DIR / "model.safetensors"
+CONFIG_PATH = MODEL_DIR / "config.json"
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+
+def inspect_weights() -> None:
+    weights = load_file(str(SAFETENSORS_PATH))
+
+    print("=" * 80)
+    print("CaLM Weight Inventory")
+    print("=" * 80)
+
+    total_params = 0
+    embedding_params = 0
+    lm_head_params = 0
+    layer_params: dict[int, int] = {}
+
+    for name in sorted(weights.keys()):
+        tensor = weights[name]
+        n = tensor.numel()
+        total_params += n
+
+        if "embeddings" in name:
+            embedding_params += n
+        elif "lm_head" in name or "cls" in name:
+            lm_head_params += n
+        else:
+            for i in range(12):
+                if f"layer.{i}." in name or f"layers.{i}." in name:
+                    layer_params[i] = layer_params.get(i, 0) + n
+                    break
+
+        print(f"  {name:60s}  {str(list(tensor.shape)):20s}  {tensor.dtype}  ({n:>10,} params)")
+
+    print("\n" + "=" * 80)
+    print("Parameter Breakdown")
+    print("=" * 80)
+    print(f"  {'Embedding':40s} {embedding_params:>12,}")
+    for i in sorted(layer_params.keys()):
+        print(f"  {'Layer ' + str(i):40s} {layer_params[i]:>12,}")
+    print(f"  {'LM Head / Classifier':40s} {lm_head_params:>12,}")
+    encoder_params = sum(layer_params.values())
+    print(f"  {'Encoder total (all layers)':40s} {encoder_params:>12,}")
+    print(f"  {'Grand total':40s} {total_params:>12,}")
+    print(f"  {'Total (millions)':40s} {total_params / 1e6:>12.2f} M")
+
+
+def verify_config() -> None:
+    config = load_config()
+
+    print("\n" + "=" * 80)
+    print("Config Verification")
+    print("=" * 80)
+
+    checks = {
+        "num_hidden_layers": 12,
+        "hidden_size": 768,
+        "num_attention_heads": 12,
+        "intermediate_size": 3072,
+    }
+
+    all_ok = True
+    for key, expected in checks.items():
+        actual = config.get(key)
+        status = "OK" if actual == expected else "MISMATCH"
+        if actual != expected:
+            all_ok = False
+        print(f"  {key:30s}  expected={expected}  actual={actual}  [{status}]")
+
+    print(f"\n  Vocab size: {config.get('vocab_size')}")
+    print(f"  Max position embeddings: {config.get('max_position_embeddings')}")
+    print(f"  Model type: {config.get('model_type')}")
+
+    if all_ok:
+        print("\n  All architecture checks passed.")
+    else:
+        print("\n  WARNING: Some checks failed!")
+
+
+if __name__ == "__main__":
+    verify_config()
+    inspect_weights()
