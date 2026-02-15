@@ -66,7 +66,7 @@ def compute_binary_metrics(
 def compute_metrics_from_logits(
     y_true: torch.Tensor,
     logits: torch.Tensor,
-    threshold: float = 0.0,
+    threshold: float = 0.5,
 ) -> dict[str, float]:
     """Compute metrics from raw logits.
 

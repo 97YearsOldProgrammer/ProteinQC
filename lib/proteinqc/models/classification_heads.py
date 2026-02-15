@@ -4,10 +4,23 @@ Three architectures:
 1. LinearHead: Single linear layer (logistic regression)
 2. MLPHead: Deep 3-layer MLP with GELU and dropout
 3. GatedHead: Gated mixture of LinearHead and MLPHead with learned routing
+
+All heads use BERT-style N(0, 0.02) initialization matching CaLM's
+initializer_range config. Biases initialized to zero.
 """
 
 import torch
 import torch.nn as nn
+
+INIT_STD = 0.02  # CaLM config: initializer_range = 0.02
+
+
+def _init_weights(module: nn.Module):
+    """BERT-style weight initialization: N(0, 0.02), bias=0."""
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, mean=0.0, std=INIT_STD)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
 class LinearHead(nn.Module):
@@ -23,6 +36,7 @@ class LinearHead(nn.Module):
     def __init__(self, hidden_size: int = 768):
         super().__init__()
         self.classifier = nn.Linear(hidden_size, 1)
+        self.apply(_init_weights)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -64,6 +78,7 @@ class MLPHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(mlp_hidden, 1),
         )
+        self.apply(_init_weights)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -130,6 +145,8 @@ class GatedHead(nn.Module):
 
         # Track gate values for analysis
         self.last_gate_values = None
+
+        self.apply(_init_weights)
 
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Forward pass with soft routing.
