@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Build species reference file for codon usage based species detection.
+
+Creates lib/proteinqc/tools/data/species_ref.npz with codon usage vectors
+for common model organisms. Strings stored as fixed-width ASCII bytes.
+
+Usage:
+    python -m proteinqc.scripts.build_species_ref
+    # or
+    build-species-ref
+
+Requires: python-codon-tables>=0.1.12
+"""
+
+from pathlib import Path
+
+import numpy as np
+from python_codon_tables import get_codons_table
+
+# 64 standard DNA codons sorted lexicographically
+_STANDARD_CODONS = sorted(
+    a + b + c for a in "ACGT" for b in "ACGT" for c in "ACGT"
+)
+_CODON_INDEX = {c: i for i, c in enumerate(_STANDARD_CODONS)}
+
+# (taxid, python-codon-tables name, human-readable display name)
+# Names from: python -c "from python_codon_tables import available_codon_tables_names; print(available_codon_tables_names)"
+_SPECIES_REGISTRY = [
+    (9606,   "h_sapiens_9606",              "Homo sapiens"),
+    (10090,  "m_musculus_10090",            "Mus musculus"),
+    (10092,  "m_musculus_domesticus_10092", "Mus musculus domesticus"),
+    (7227,   "d_melanogaster_7227",         "Drosophila melanogaster"),
+    (6239,   "c_elegans_6239",              "Caenorhabditis elegans"),
+    (4932,   "s_cerevisiae_4932",           "Saccharomyces cerevisiae"),
+    (316407, "e_coli_316407",               "Escherichia coli"),
+    (9031,   "g_gallus_9031",               "Gallus gallus"),
+    (1423,   "b_subtilis_1423",             "Bacillus subtilis"),
+]
+
+
+def _get_usage_vector(species_name: str) -> np.ndarray:
+    """Build 64-dim L1-normalized codon usage vector from python-codon-tables."""
+    raw = get_codons_table(species_name)
+    vec = np.zeros(64, dtype=np.float32)
+    for codon, freq in raw.items():
+        dna_codon = codon.upper().replace("U", "T")
+        if dna_codon in _CODON_INDEX:
+            vec[_CODON_INDEX[dna_codon]] = float(freq)
+    total = vec.sum()
+    if total > 0:
+        vec = vec / total
+    return vec
+
+
+def main():
+    output_dir = Path(__file__).parent.parent / "tools" / "data"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "species_ref.npz"
+
+    taxids, names, display_names, vectors = [], [], [], []
+
+    for taxid, pct_name, display in _SPECIES_REGISTRY:
+        try:
+            vec = _get_usage_vector(pct_name)
+            taxids.append(taxid)
+            names.append(pct_name)
+            display_names.append(display)
+            vectors.append(vec)
+            print(f"  OK  {display:35s}  ({pct_name})")
+        except Exception as exc:
+            print(f"  SKIP {display} ({pct_name}): {exc}")
+
+    # Store strings as fixed-width ASCII bytes (numeric-compatible, no object arrays)
+    max_name_len = max(len(s) for s in names)
+    max_display_len = max(len(s) for s in display_names)
+    names_arr = np.array(
+        [s.encode("ascii").ljust(max_name_len) for s in names],
+        dtype=f"|S{max_name_len}",
+    )
+    display_arr = np.array(
+        [s.encode("ascii").ljust(max_display_len) for s in display_names],
+        dtype=f"|S{max_display_len}",
+    )
+
+    np.savez(
+        output_path,
+        taxids=np.array(taxids, dtype=np.int64),
+        names=names_arr,
+        display_names=display_arr,
+        vectors=np.stack(vectors, axis=0),
+    )
+
+    print(f"\nSaved {len(taxids)} species → {output_path}")
+    print(f"Vectors shape: {np.stack(vectors).shape}")
+
+
+if __name__ == "__main__":
+    main()
