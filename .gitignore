@@ -10,9 +10,13 @@ build/
 
 # Models & Data (large files)
 models/calm/*.safetensors
+models/heads/*.pt
 data/rnachallenge/*.fa
 data/rnachallenge/*.tsv
+data/rnachallenge/evidence_baked.jsonl
 data/supplements/*.zip
+data/benchmark/
+data/ProteinQC/
 
 # Jupyter
 .ipynb_checkpoints/

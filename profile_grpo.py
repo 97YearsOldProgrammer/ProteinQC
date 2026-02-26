@@ -1,0 +1,145 @@
+"""Profile GRPO training to find bottlenecks."""
+import time
+import sys
+sys.path.insert(0, "lib")
+
+# 1. Load data
+print("=== Loading data ===")
+t0 = time.time()
+from proteinqc.agent.rnachallenge_loader import load_rnachallenge
+train_data, test_data = load_rnachallenge("data/rnachallenge/rnachallenge.tsv")
+item = train_data[0]
+print(f"  Data load: {time.time()-t0:.2f}s")
+print(f"  Sample: {item['sequence_id']}, label={item['label']}, len={len(item['sequence'])}bp")
+
+# 2. Load models
+print("\n=== Loading MLX backend ===")
+t0 = time.time()
+from proteinqc.agent.mlx_backend import MLXBackend
+backend = MLXBackend()
+t_model = time.time() - t0
+print(f"  Model load (policy+ref): {t_model:.2f}s")
+
+# 3. Load tools
+print("\n=== Loading tool executor ===")
+t0 = time.time()
+from proteinqc.agent.tool_schema import ToolExecutor
+tools = ToolExecutor(calm_model_dir="models/calm", calm_head_path="models/heads/mlp_head_v1.pt")
+print(f"  Tool load: {time.time()-t0:.2f}s")
+
+# 4. Profile single generation
+print("\n=== Profiling generation (inference) ===")
+from proteinqc.agent.prompt import build_initial_prompt
+messages = build_initial_prompt(item["sequence"])
+print(f"  Prompt tokens: {len(backend.tokenize_chat(messages))}")
+
+times_gen = []
+for i in range(3):
+    t0 = time.time()
+    response = backend.generate(messages, max_tokens=256, temp=0.8, top_p=0.9)
+    elapsed = time.time() - t0
+    times_gen.append(elapsed)
+    n_tokens = len(backend.tokenizer.encode(response))
+    print(f"  Gen {i+1}: {elapsed:.2f}s, {n_tokens} tokens, {n_tokens/elapsed:.1f} tok/s")
+
+# 5. Profile tool execution
+print("\n=== Profiling tool execution ===")
+from proteinqc.agent.prompt import parse_tool_call
+tc = parse_tool_call(response)
+if tc:
+    print(f"  Tool call: {tc['name']}({list(tc['arguments'].keys())})")
+    t0 = time.time()
+    result = tools.execute(tc["name"], tc["arguments"])
+    t_tool = time.time() - t0
+    print(f"  Tool exec: {t_tool:.2f}s")
+    print(f"  Result preview: {str(result)[:100]}...")
+else:
+    print(f"  No tool call parsed. Response: {response[:200]}")
+    t_tool = 0
+
+# 6. Profile log-prob computation
+print("\n=== Profiling log-prob computation ===")
+import mlx.core as mx
+prompt_tokens = backend.tokenize_chat(messages)
+comp_tokens = backend.tokenizer.encode(response)
+print(f"  Prompt: {len(prompt_tokens)} tokens, Completion: {len(comp_tokens)} tokens")
+
+times_lp = []
+for i in range(3):
+    t0 = time.time()
+    lp = backend.compute_log_probs(prompt_tokens, comp_tokens)
+    mx.synchronize()
+    elapsed = time.time() - t0
+    times_lp.append(elapsed)
+    print(f"  Log-prob {i+1}: {elapsed:.2f}s (val={lp.item():.4f})")
+
+times_ref = []
+for i in range(3):
+    t0 = time.time()
+    lp = backend.compute_ref_log_probs(prompt_tokens, comp_tokens)
+    mx.synchronize()
+    elapsed = time.time() - t0
+    times_ref.append(elapsed)
+    print(f"  Ref log-prob {i+1}: {elapsed:.2f}s")
+
+# 7. Profile gradient update
+print("\n=== Profiling gradient update ===")
+from proteinqc.agent.mlx_backend import compute_grpo_loss
+import mlx.nn as nn
+
+old_lp = backend.compute_log_probs(prompt_tokens, comp_tokens)
+ref_lp = backend.compute_ref_log_probs(prompt_tokens, comp_tokens)
+mx.synchronize()
+
+advantages = mx.array([1.0])
+old_lps = mx.array([old_lp.item()])
+ref_lps = mx.array([ref_lp.item()])
+
+optimizer = backend.get_optimizer(lr=2e-5)
+
+def loss_fn(model):
+    return compute_grpo_loss(
+        model, prompt_tokens, [comp_tokens],
+        advantages, old_lps, ref_lps, beta=0.05, clip_eps=0.2,
+    )
+
+t0 = time.time()
+(loss, metrics), grads = nn.value_and_grad(backend.model, loss_fn)(backend.model)
+mx.synchronize()
+t_grad = time.time() - t0
+print(f"  Forward+backward: {t_grad:.2f}s")
+
+t0 = time.time()
+optimizer.update(backend.model, grads)
+mx.synchronize()
+t_optim = time.time() - t0
+print(f"  Optimizer step: {t_optim:.2f}s")
+
+# 8. Summary
+print("\n" + "=" * 60)
+print("PROFILE SUMMARY")
+print("=" * 60)
+avg_gen = sum(times_gen) / len(times_gen)
+avg_lp = sum(times_lp) / len(times_lp)
+avg_ref = sum(times_ref) / len(times_ref)
+print(f"  Generation (inference): {avg_gen:.2f}s avg ({times_gen[0]:.2f}s first)")
+print(f"  Tool execution:         {t_tool:.2f}s")
+print(f"  Log-prob (policy):      {avg_lp:.2f}s avg")
+print(f"  Log-prob (ref):         {avg_ref:.2f}s avg")
+print(f"  Gradient (fwd+bwd):     {t_grad:.2f}s")
+print(f"  Optimizer step:         {t_optim:.2f}s")
+print()
+
+# Per-step estimate (group_size=4, max_tools=3, grad_accum=4)
+gen_per_step = 4 * 4 * 3  # group_size * grad_accum * max_tool_rounds
+lp_per_step = 4 * 4 * 2   # episodes * (old + ref)
+est_gen = gen_per_step * avg_gen
+est_lp = lp_per_step * avg_lp
+est_update = t_grad + t_optim
+est_total = est_gen + est_lp + est_update
+print(f"  Estimated per training step (worst case):")
+print(f"    Generation:  {gen_per_step} calls x {avg_gen:.1f}s = {est_gen:.0f}s ({est_gen/est_total*100:.0f}%)")
+print(f"    Log-probs:   {lp_per_step} calls x {avg_lp:.1f}s = {est_lp:.0f}s ({est_lp/est_total*100:.0f}%)")
+print(f"    Grad update: {est_update:.1f}s ({est_update/est_total*100:.0f}%)")
+print(f"    TOTAL:       {est_total:.0f}s ({est_total/60:.1f} min)")
+print(f"    Full run (16,368 steps): {est_total*16368/3600:.0f} hours")

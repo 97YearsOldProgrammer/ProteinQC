@@ -1,0 +1,306 @@
+"""TRL GRPO training script for RunPod CUDA GPUs.
+
+Port of the MLX GRPOTrainerV2 to HuggingFace TRL. Self-contained script
+that loads pre-baked evidence and trains Llama 3.1 8B with QLoRA.
+
+Usage:
+    pip install trl peft bitsandbytes datasets accelerate torch
+    python train_grpo_trl.py --data evidence_baked.jsonl --dry-run 5
+    python train_grpo_trl.py --data evidence_baked.jsonl --epochs 2
+    python train_grpo_trl.py --data evidence_baked.jsonl --quant 8bit
+    python train_grpo_trl.py --data evidence_baked.jsonl --quant bf16
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+import torch
+from datasets import Dataset
+from peft import LoraConfig
+from transformers import BitsAndBytesConfig
+from trl import GRPOConfig, GRPOTrainer
+
+# ---------------------------------------------------------------------------
+# Prompt construction (inlined from prompt_v2.py to keep script self-contained)
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """\
+You are an RNA bioinformatics expert classifying sequences as coding or non-coding.
+
+You will receive pre-computed biological evidence for a sequence. Analyze ALL evidence, \
+then respond EXACTLY in this format (no other text):
+
+<reasoning>
+Your analysis of the evidence (2-4 sentences). Mention which signals are most informative.
+</reasoning>
+<classification>coding</classification>
+<confidence>0.85</confidence>
+
+## Evidence interpretation guide:
+- CaLM score: Coding probability from a codon-level BERT encoder (85M params, 131 codon vocab, \
+trained on multi-species CDS). Range [0,1]. >0.5 suggests coding, <0.3 suggests noncoding.
+- Perplexity: Pseudo-perplexity from masked codon prediction. Lower = more natural codon usage. \
+<5 typical for real CDS, >8 for non-coding.
+- Protein preview: First 50 amino acids from longest-ORF translation.
+- Protein length: Full translated protein length in amino acids.
+- Pfam domains: Known protein domain hits from Pfam-A HMM scan. Any hit = strong coding evidence.
+
+Rules:
+- confidence must be a number between 0.0 and 1.0
+- classification must be exactly "coding" or "noncoding"
+- Do NOT call any tools. All evidence is pre-computed."""
+
+USER_TEMPLATE = """\
+Classify this RNA sequence:
+
+| Field | Value |
+|-------|-------|
+| Species | {species} |
+| Length | {n_bp} bp ({n_codons} codons) |
+| CaLM score | {calm_score} |
+| Perplexity | {perplexity} |
+| Protein (first 50aa) | {protein_preview} |
+| Protein length | {protein_length} |
+| Pfam domains | {pfam_domains} |"""
+
+_RE_CLASSIFICATION = re.compile(
+    r"<classification>\s*(coding|noncoding)\s*</classification>"
+)
+_RE_TAGS = re.compile(
+    r"<reasoning>.*?</reasoning>\s*"
+    r"<classification>.*?</classification>\s*"
+    r"<confidence>.*?</confidence>",
+    re.DOTALL,
+)
+
+
+def _build_prompt(row: dict) -> list[dict]:
+    """Build chat messages from a baked evidence dict."""
+    calm = row.get("calm_score")
+    calm_str = f"{calm:.4f}" if calm is not None else "N/A"
+    ppl = row.get("perplexity")
+    ppl_str = f"{ppl:.2f}" if ppl is not None else "N/A"
+
+    translation = row.get("translation") or ""
+    if translation:
+        preview = translation[:50] + ("..." if len(translation) > 50 else "")
+        protein_len = f"{len(translation)} aa"
+    else:
+        preview = "(no translation)"
+        protein_len = "0 aa"
+
+    domains = row.get("pfam_domains") or []
+    domain_str = "; ".join(domains) if domains else "no domain hits"
+
+    seq = row.get("sequence", "")
+    n_bp = len(seq)
+    n_codons = n_bp // 3
+
+    user_msg = USER_TEMPLATE.format(
+        species=row.get("species", "unknown"),
+        n_bp=n_bp,
+        n_codons=n_codons,
+        calm_score=calm_str,
+        perplexity=ppl_str,
+        protein_preview=preview,
+        protein_length=protein_len,
+        pfam_domains=domain_str,
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_msg},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Reward functions (TRL signature: completions + extra dataset columns as kwargs)
+# ---------------------------------------------------------------------------
+
+def _extract_text(completion) -> str:
+    """Extract text from a TRL completion (may be str or list of message dicts)."""
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, list):
+        # TRL v0.29+ passes [{"role": "assistant", "content": "..."}]
+        for msg in completion:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                return msg.get("content", "")
+        return str(completion)
+    return str(completion)
+
+
+def accuracy_reward(completions, label, **kwargs) -> list[float]:
+    """1.0 if parsed classification matches ground-truth label, else 0.0."""
+    rewards = []
+    for completion, gt in zip(completions, label):
+        text = _extract_text(completion)
+        match = _RE_CLASSIFICATION.search(text)
+        prediction = match.group(1) if match else "noncoding"
+        rewards.append(1.0 if prediction == gt else 0.0)
+    return rewards
+
+
+def format_reward(completions, **kwargs) -> list[float]:
+    """0.5 if output has proper XML structure, else 0.0."""
+    rewards = []
+    for completion in completions:
+        text = _extract_text(completion)
+        has_structure = bool(_RE_TAGS.search(text))
+        rewards.append(0.5 if has_structure else 0.0)
+    return rewards
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_dataset_from_jsonl(path: str, limit: int | None = None) -> Dataset:
+    """Load baked evidence JSONL into a HuggingFace Dataset.
+
+    Returns dataset with columns: prompt, label, sequence_id
+    (plus any extra columns TRL might pass through).
+    """
+    rows = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            rows.append({
+                "prompt": _build_prompt(obj),
+                "label": obj["label"],
+                "sequence_id": obj["sequence_id"],
+            })
+            if limit and len(rows) >= limit:
+                break
+
+    print(f"Loaded {len(rows)} sequences from {path}")
+    coding = sum(1 for r in rows if r["label"] == "coding")
+    print(f"  coding: {coding}, noncoding: {len(rows) - coding}")
+    return Dataset.from_list(rows)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="TRL GRPO trainer for ProteinQC")
+    parser.add_argument("--data", required=True, help="Path to evidence_baked.jsonl")
+    parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct",
+                        help="HuggingFace model ID")
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--dry-run", type=int, default=0,
+                        help="If >0, train on only this many sequences")
+    parser.add_argument("--output-dir", default="./grpo_output")
+    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--group-size", type=int, default=8,
+                        help="Generations per prompt (num_generations)")
+    parser.add_argument("--grad-accum", type=int, default=4)
+    parser.add_argument("--max-completion", type=int, default=300)
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--beta", type=float, default=0.04, help="KL penalty")
+    parser.add_argument("--epsilon", type=float, default=0.2, help="PPO clip")
+    parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--quant", choices=["4bit", "8bit", "bf16"], default="4bit",
+                        help="Quantization: 4bit (NF4), 8bit, or bf16 (no quant)")
+    args = parser.parse_args()
+
+    # Data
+    limit = args.dry_run if args.dry_run > 0 else None
+    dataset = load_dataset_from_jsonl(args.data, limit=limit)
+
+    # Quantization config
+    model_kwargs: dict = {}
+    if args.quant == "4bit":
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+    elif args.quant == "8bit":
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+    else:
+        model_kwargs["torch_dtype"] = torch.bfloat16
+
+    # LoRA
+    peft_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_rank,
+        target_modules="all-linear",
+        task_type="CAUSAL_LM",
+        lora_dropout=0.05,
+    )
+
+    # GRPO config
+    max_steps = args.dry_run if args.dry_run > 0 else -1
+    training_args = GRPOConfig(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs if max_steps == -1 else 1,
+        max_steps=max_steps if max_steps > 0 else -1,
+        learning_rate=args.lr,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=args.grad_accum,
+        num_generations=args.group_size,
+        generation_batch_size=args.group_size,
+        max_completion_length=args.max_completion,
+        # GRPO-specific
+        loss_type="grpo",
+        beta=args.beta,
+        epsilon=args.epsilon,
+        temperature=0.9,
+        mask_truncated_completions=True,
+        # Training
+        warmup_steps=args.warmup_steps,
+        bf16=True,
+        gradient_checkpointing=True,
+        logging_steps=1,
+        save_steps=500,
+        save_total_limit=3,
+        report_to="none",
+        max_grad_norm=1.0,
+        seed=42,
+        log_completions=True,
+        model_init_kwargs=model_kwargs,
+    )
+
+    # Trainer
+    trainer = GRPOTrainer(
+        model=args.model,
+        reward_funcs=[accuracy_reward, format_reward],
+        args=training_args,
+        train_dataset=dataset,
+        peft_config=peft_config,
+    )
+
+    print(f"\n{'='*60}")
+    print(f"  TRL GRPO Training")
+    print(f"  Model: {args.model}")
+    print(f"  Quant: {args.quant}")
+    print(f"  Loss: grpo, Temp: 0.9")
+    print(f"  Data: {len(dataset)} sequences")
+    print(f"  Epochs: {args.epochs}, Max steps: {max_steps}")
+    print(f"  Num gens: {args.group_size}, Grad accum: {args.grad_accum}")
+    print(f"  LR: {args.lr}, Beta: {args.beta}, Epsilon: {args.epsilon}")
+    print(f"  LoRA rank: {args.lora_rank}")
+    print(f"  Max completion: {args.max_completion} tokens")
+    print(f"  Warmup steps: {args.warmup_steps}")
+    print(f"  Output: {args.output_dir}")
+    print(f"{'='*60}\n")
+
+    trainer.train()
+    trainer.save_model(args.output_dir + "/final_adapter")
+    print(f"\nDone. Adapter saved to {args.output_dir}/final_adapter")
+
+
+if __name__ == "__main__":
+    main()

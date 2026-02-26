@@ -1,0 +1,108 @@
+"""Download GENCODE v49 reference data for evaluation and RL training.
+
+Downloads protein-coding transcripts, translations, lncRNA transcripts,
+and annotation GTF from GENCODE FTP. These provide:
+  - Positives: protein-coding transcripts with known CDS boundaries
+  - Negatives: lncRNA transcripts (non-coding)
+  - Ground truth: GTF annotation for CDS coordinate extraction
+
+Usage:
+    download-gencode                              # default: data/gencode/v49/
+    download-gencode --output-dir /path/to/data
+    download-gencode --release 46                 # specific release
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import urllib.request
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+
+GENCODE_FTP = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human"
+
+FILES = [
+    "gencode.v{release}.pc_transcripts.fa.gz",
+    "gencode.v{release}.pc_translations.fa.gz",
+    "gencode.v{release}.lncRNA_transcripts.fa.gz",
+    "gencode.v{release}.annotation.gtf.gz",
+]
+
+
+def _download(url: str, dest: Path) -> None:
+    """Download a file with progress reporting."""
+    print(f"  {url}")
+    print(f"  → {dest}")
+
+    def _report(block_num: int, block_size: int, total_size: int) -> None:
+        downloaded = block_num * block_size
+        if total_size > 0:
+            pct = min(100, downloaded * 100 // total_size)
+            mb = downloaded / (1024 * 1024)
+            total_mb = total_size / (1024 * 1024)
+            print(f"\r  {mb:.1f}/{total_mb:.1f} MB ({pct}%)", end="", flush=True)
+
+    urllib.request.urlretrieve(url, str(dest), reporthook=_report)
+    print()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Download GENCODE reference data for evaluation/training"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Output directory (default: data/gencode/v{release}/)",
+    )
+    parser.add_argument(
+        "--release",
+        type=int,
+        default=49,
+        help="GENCODE release number (default: 49)",
+    )
+    args = parser.parse_args()
+
+    release = args.release
+    out_dir = args.output_dir or (_PROJECT_ROOT / "data" / "gencode" / f"v{release}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    base_url = f"{GENCODE_FTP}/release_{release}"
+
+    print(f"=== Downloading GENCODE v{release} ===")
+    print(f"Output: {out_dir}\n")
+
+    for template in FILES:
+        filename = template.format(release=release)
+        dest = out_dir / filename
+        url = f"{base_url}/{filename}"
+
+        if dest.exists():
+            size_mb = dest.stat().st_size / (1024 * 1024)
+            print(f"  {filename} already exists ({size_mb:.1f} MB), skipping.")
+            continue
+
+        print(f"Downloading {filename}...")
+        try:
+            _download(url, dest)
+        except Exception as e:
+            print(f"  ERROR downloading {filename}: {e}", file=sys.stderr)
+            print("  Continuing with remaining files...", file=sys.stderr)
+            continue
+
+    print("\nDone. Downloaded files:")
+    for f in sorted(out_dir.iterdir()):
+        size_mb = f.stat().st_size / (1024 * 1024)
+        print(f"  {f.name:55s} {size_mb:8.1f} MB")
+
+    print(f"\nEvaluation plan:")
+    print(f"  1. Extract CDS ORFs from pc_transcripts using GTF coordinates")
+    print(f"  2. Compute CaLM perplexity on: real CDS, lncRNA ORFs, random")
+    print(f"  3. Run Pfam on translated ORFs: measure hit rate real vs spurious")
+
+
+if __name__ == "__main__":
+    main()

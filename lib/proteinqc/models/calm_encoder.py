@@ -6,7 +6,7 @@ Loads pre-trained CaLM weights from safetensors and provides
 """
 
 import json
-import math
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -136,20 +136,37 @@ class TransformerLayer(nn.Module):
         return x
 
 
+class CaLMLMHead(nn.Module):
+    """Linear(768→768) → GELU → LayerNorm → Linear(768→131) + bias."""
+
+    def __init__(self, hidden_size: int, vocab_size: int, layer_norm_eps: float):
+        super().__init__()
+        self.dense = nn.Linear(hidden_size, hidden_size)
+        self.layer_norm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.decoder = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(vocab_size))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """[batch, seq, hidden] → [batch, seq, vocab] logits."""
+        x = self.dense(hidden_states)
+        x = F.gelu(x)
+        x = self.layer_norm(x)
+        x = self.decoder(x) + self.bias
+        return x
+
+
+_log = logging.getLogger(__name__)
+
+
 class CaLMEncoder(nn.Module):
-    """CaLM BERT encoder for RNA sequences (codon-level tokenization).
+    """Pure PyTorch CaLM BERT encoder (12-layer Pre-LN, RoPE, 131 codon vocab)."""
 
-    Pure PyTorch implementation — no HuggingFace dependencies.
-
-    Architecture: 12-layer Pre-LN BERT with RoPE, 768 hidden, 131 vocab.
-    Loads weights from safetensors and provides [CLS] embedding extraction.
-
-    Args:
-        model_dir: Path to CaLM model directory (config.json + model.safetensors)
-        freeze: If True, freeze all encoder parameters (default: True)
-    """
-
-    def __init__(self, model_dir: Path | str, freeze: bool = True):
+    def __init__(
+        self,
+        model_dir: Path | str,
+        freeze: bool = True,
+        load_lm_head: bool = False,
+    ):
         super().__init__()
         self.model_dir = Path(model_dir)
         self.config = self._load_config()
@@ -188,6 +205,15 @@ class CaLMEncoder(nn.Module):
         # Final LayerNorm (applied after all transformer layers)
         self.emb_layer_norm_after = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
 
+        # Optional LM head for MLM / perplexity scoring
+        self.lm_head: Optional[CaLMLMHead] = None
+        if load_lm_head:
+            self.lm_head = CaLMLMHead(
+                hidden_size=hidden_size,
+                vocab_size=self.config["vocab_size"],
+                layer_norm_eps=layer_norm_eps,
+            )
+
         # RoPE cache (lazily built on first forward)
         self._rope_cos: Optional[torch.Tensor] = None
         self._rope_sin: Optional[torch.Tensor] = None
@@ -209,11 +235,14 @@ class CaLMEncoder(nn.Module):
         raw = load_file(str(self.model_dir / "model.safetensors"))
         mapped = self._map_weight_keys(raw)
 
+        if self.lm_head is not None:
+            self._map_lm_head_keys(raw, mapped)
+
         missing, unexpected = self.load_state_dict(mapped, strict=False)
         if missing:
             raise RuntimeError(f"Missing keys in weight loading: {missing}")
         if unexpected:
-            print(f"  Note: {len(unexpected)} unused keys (lm_head etc.)")
+            _log.warning("Unused keys in weight loading (%d)", len(unexpected))
 
     def _map_weight_keys(self, raw: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Map safetensors keys → our state_dict keys."""
@@ -259,6 +288,19 @@ class CaLMEncoder(nn.Module):
 
         return mapped
 
+    def _map_lm_head_keys(
+        self,
+        raw: dict[str, torch.Tensor],
+        mapped: dict[str, torch.Tensor],
+    ):
+        """Map LM head weights from safetensors into our CaLMLMHead."""
+        mapped["lm_head.dense.weight"] = raw["lm_head.transform.dense.weight"]
+        mapped["lm_head.dense.bias"] = raw["lm_head.transform.dense.bias"]
+        mapped["lm_head.layer_norm.weight"] = raw["lm_head.transform.layer_norm.weight"]
+        mapped["lm_head.layer_norm.bias"] = raw["lm_head.transform.layer_norm.bias"]
+        mapped["lm_head.decoder.weight"] = raw["lm_head.decoder.weight"]
+        mapped["lm_head.bias"] = raw["lm_head.bias"]
+
     def _ensure_rope(self, seq_len: int, device: torch.device):
         """Build or extend RoPE cos/sin cache if needed."""
         if seq_len > self._rope_seq_len or self._rope_cos is None:
@@ -267,48 +309,52 @@ class CaLMEncoder(nn.Module):
             )
             self._rope_seq_len = seq_len
 
+    def _encode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encoder forward pass → hidden states [batch, seq, hidden]."""
+        device = input_ids.device
+        seq_len = input_ids.shape[1]
+
+        if attention_mask is None:
+            attention_mask = input_ids.ne(self.config["pad_token_id"]).long()
+
+        x = self.word_embeddings(input_ids)
+        x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+
+        sdpa_mask = attention_mask[:, None, None, :].bool()  # [B,1,1,S] for SDPA broadcast
+
+        self._ensure_rope(seq_len, device)
+        cos = self._rope_cos.to(device=device, dtype=x.dtype)
+        sin = self._rope_sin.to(device=device, dtype=x.dtype)
+
+        for layer in self.layers:
+            x = layer(x, sdpa_mask, cos, sin)
+
+        return self.emb_layer_norm_after(x)
+
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Extract [CLS] embeddings from RNA codon sequences.
+        """[CLS] embeddings [batch, hidden] from codon sequences."""
+        return self._encode(input_ids, attention_mask)[:, 0, :]
 
-        Args:
-            input_ids: Tokenized codon sequences [batch, seq_len]
-            attention_mask: 1=attend, 0=pad [batch, seq_len] (optional)
-
-        Returns:
-            [CLS] token embeddings [batch, hidden_size]
-        """
-        device = input_ids.device
-        seq_len = input_ids.shape[1]
-
-        # Auto-generate attention mask from padding
-        if attention_mask is None:
-            attention_mask = input_ids.ne(self.config["pad_token_id"]).long()
-
-        # Embeddings (zero out pad positions, matching CaLM)
-        x = self.word_embeddings(input_ids)
-        x = x * attention_mask.unsqueeze(-1).to(x.dtype)
-
-        # Prepare attention mask for SDPA: [batch, 1, 1, seq] boolean
-        sdpa_mask = attention_mask[:, None, None, :].bool()
-
-        # Ensure RoPE cache covers this sequence length
-        self._ensure_rope(seq_len, device)
-        cos = self._rope_cos.to(device=device, dtype=x.dtype)
-        sin = self._rope_sin.to(device=device, dtype=x.dtype)
-
-        # Transformer layers
-        for layer in self.layers:
-            x = layer(x, sdpa_mask, cos, sin)
-
-        # Final LayerNorm
-        x = self.emb_layer_norm_after(x)
-
-        # [CLS] token is index 0
-        return x[:, 0, :]
+    def forward_mlm(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """MLM logits [batch, seq, vocab]. Requires load_lm_head=True."""
+        if self.lm_head is None:
+            raise RuntimeError(
+                "LM head not loaded. Construct CaLMEncoder with load_lm_head=True."
+            )
+        hidden = self._encode(input_ids, attention_mask)
+        return self.lm_head(hidden)
 
     @property
     def device(self) -> torch.device:

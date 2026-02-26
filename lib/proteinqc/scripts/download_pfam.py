@@ -1,0 +1,139 @@
+"""Download Pfam-A and AntiFam HMM databases for domain scanning.
+
+Downloads from InterPro FTP (Pfam-A) and EBI FTP (AntiFam),
+decompresses, and runs hmmpress to build search indices.
+
+Usage:
+    download-pfam                          # default: models/pfam/
+    download-pfam --output-dir /path/to/db
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+
+PFAM_URL = (
+    "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/Pfam-A.hmm.gz"
+)
+ANTIFAM_URL = (
+    "https://ftp.ebi.ac.uk/pub/databases/Pfam/AntiFam/current/Antifam.tar.gz"
+)
+# AntiFam is distributed as a tarball; the HMM is inside it.
+# Simpler alternative: direct HMM download if available.
+ANTIFAM_HMM_URL = (
+    "https://ftp.ebi.ac.uk/pub/databases/Pfam/AntiFam/current/AntiFam.hmm.gz"
+)
+
+
+def _download(url: str, dest: Path) -> None:
+    """Download a file with progress reporting."""
+    print(f"  Downloading {url}")
+    print(f"  → {dest}")
+
+    def _report(block_num: int, block_size: int, total_size: int) -> None:
+        downloaded = block_num * block_size
+        if total_size > 0:
+            pct = min(100, downloaded * 100 // total_size)
+            mb = downloaded / (1024 * 1024)
+            total_mb = total_size / (1024 * 1024)
+            print(f"\r  {mb:.1f}/{total_mb:.1f} MB ({pct}%)", end="", flush=True)
+
+    urllib.request.urlretrieve(url, str(dest), reporthook=_report)
+    print()
+
+
+def _decompress_gz(gz_path: Path, out_path: Path) -> None:
+    """Decompress a .gz file."""
+    print(f"  Decompressing {gz_path.name} → {out_path.name}")
+    with gzip.open(gz_path, "rb") as f_in, open(out_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    gz_path.unlink()
+
+
+def _hmmpress(hmm_path: Path) -> None:
+    """Run hmmpress to build HMM database indices."""
+    print(f"  Running hmmpress on {hmm_path.name}")
+    result = subprocess.run(
+        ["hmmpress", str(hmm_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"  hmmpress stderr: {result.stderr}", file=sys.stderr)
+        raise RuntimeError(f"hmmpress failed on {hmm_path}")
+    print(f"  Indexed: {hmm_path.name}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Download Pfam-A and AntiFam HMM databases"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=_PROJECT_ROOT / "models" / "pfam",
+        help="Output directory (default: models/pfam/)",
+    )
+    parser.add_argument(
+        "--skip-antifam",
+        action="store_true",
+        help="Skip AntiFam download",
+    )
+    args = parser.parse_args()
+
+    out_dir: Path = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if shutil.which("hmmpress") is None:
+        print("ERROR: hmmpress not found. Install HMMER3:", file=sys.stderr)
+        print("  conda install -c bioconda hmmer", file=sys.stderr)
+        sys.exit(1)
+
+    # --- Pfam-A ---
+    pfam_hmm = out_dir / "Pfam-A.hmm"
+    if pfam_hmm.exists():
+        print(f"Pfam-A.hmm already exists at {pfam_hmm}, skipping download.")
+    else:
+        print("=== Downloading Pfam-A ===")
+        pfam_gz = out_dir / "Pfam-A.hmm.gz"
+        _download(PFAM_URL, pfam_gz)
+        _decompress_gz(pfam_gz, pfam_hmm)
+
+    # hmmpress if index missing
+    if not pfam_hmm.with_suffix(".hmm.h3m").exists():
+        _hmmpress(pfam_hmm)
+    else:
+        print(f"Pfam-A index already exists, skipping hmmpress.")
+
+    # --- AntiFam ---
+    if not args.skip_antifam:
+        antifam_hmm = out_dir / "AntiFam.hmm"
+        if antifam_hmm.exists():
+            print(f"AntiFam.hmm already exists at {antifam_hmm}, skipping download.")
+        else:
+            print("\n=== Downloading AntiFam ===")
+            antifam_gz = out_dir / "AntiFam.hmm.gz"
+            _download(ANTIFAM_HMM_URL, antifam_gz)
+            _decompress_gz(antifam_gz, antifam_hmm)
+
+        if not antifam_hmm.with_suffix(".hmm.h3m").exists():
+            _hmmpress(antifam_hmm)
+        else:
+            print(f"AntiFam index already exists, skipping hmmpress.")
+
+    print("\nDone. Database files:")
+    for f in sorted(out_dir.iterdir()):
+        size_mb = f.stat().st_size / (1024 * 1024)
+        print(f"  {f.name:30s} {size_mb:8.1f} MB")
+
+
+if __name__ == "__main__":
+    main()

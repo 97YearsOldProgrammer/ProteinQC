@@ -14,11 +14,12 @@ from proteinqc.models.classification_heads import (
     MLPHead,
 )
 from proteinqc.models.norm_convert import convert_layernorm_to_rmsnorm
-from proteinqc.pipeline import ORFPipeline, ScoredORF
+from proteinqc.pipeline import EnrichedORF, ORFPipeline, ScoredORF
 
 __all__ = [
     "CaLMEncoder",
     "CodonTokenizer",
+    "EnrichedORF",
     "LinearHead",
     "MLPHead",
     "GatedHead",

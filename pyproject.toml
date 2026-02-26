@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proteinqc"
+version = "0.2.0"
+description = "RL/MCTS-based mRNA ORF exploration and protein quality prediction"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Gong Chen", email = "gongchen@example.com"}
+]
+keywords = ["RNA", "protein", "CaLM", "classification", "deep-learning"]
+
+dependencies = [
+    "torch>=2.0.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20.0",
+    "numpy>=1.24.0",
+    "biopython>=1.83",
+    "python-codon-tables>=0.1.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+verify = [
+    "multimolecule>=0.1.0",
+]
+train = [
+    "datasets>=2.0.0",
+    "accelerate>=0.20.0",
+]
+deploy = [
+    "coremltools>=7.0.0",
+    "ane-transformers>=0.1.0",
+]
+agent = [
+    "mlx>=0.22; sys_platform == 'darwin'",
+    "mlx-lm>=0.25; sys_platform == 'darwin'",
+    "psutil>=5.9.0",
+]
+
+[project.scripts]
+download-calm = "proteinqc.scripts.download_calm:main"
+inspect-calm = "proteinqc.scripts.inspect_calm:main"
+benchmark = "proteinqc.scripts.benchmark:main"
+save-mlp-head = "proteinqc.scripts.save_mlp_head:main"
+build-species-ref = "proteinqc.scripts.build_species_ref:main"
+download-pfam = "proteinqc.scripts.download_pfam:main"
+download-gencode = "proteinqc.scripts.download_gencode:main"
+train-agent = "proteinqc.scripts.train_agent:main"
+bake-evidence = "proteinqc.scripts.bake_evidence:main"
+
+[tool.setuptools.packages.find]
+where = ["lib"]
+
+[tool.setuptools.package-data]
+"proteinqc.tools" = ["data/*.npz"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311"]
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
