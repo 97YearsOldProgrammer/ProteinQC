@@ -51,19 +51,18 @@ smolagents = [
 ]
 
 [project.scripts]
-download-calm = "proteinqc.scripts.download_calm:main"
-inspect-calm = "proteinqc.scripts.inspect_calm:main"
-benchmark = "proteinqc.scripts.benchmark:main"
-save-mlp-head = "proteinqc.scripts.save_mlp_head:main"
-build-species-ref = "proteinqc.scripts.build_species_ref:main"
-download-pfam = "proteinqc.scripts.download_pfam:main"
-download-gencode = "proteinqc.scripts.download_gencode:main"
-train-agent = "proteinqc.scripts.train_agent:main"
-bake-evidence = "proteinqc.scripts.bake_evidence:main"
-run-agent = "proteinqc.scripts.run_agent:main"
+benchmark = "proteinqc.cli.benchmark:main"
+benchmark-multispecies = "proteinqc.cli.benchmark_multispecies:main"
+rna-challenge-retest = "proteinqc.cli.rna_challenge_retest:main"
+save-mlp-head = "proteinqc.cli.save_mlp_head:main"
+bake-evidence = "proteinqc.cli.bake_evidence:main"
+train-agent = "proteinqc.cli.train_agent:main"
+run-agent = "proteinqc.cli.run_agent:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["proteinqc*"]
+namespaces = false
 
 [tool.setuptools.package-data]
 "proteinqc.tools" = ["data/*.npz"]

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """TRL GRPO training script for RunPod CUDA GPUs.
 
 Port of the MLX GRPOTrainerV2 to HuggingFace TRL. Self-contained script

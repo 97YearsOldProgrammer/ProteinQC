@@ -15,15 +15,12 @@ Usage:
 import argparse
 import json
 import re
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from proteinqc.data.tokenizer import CodonTokenizer
 from proteinqc.models.calm_encoder import CaLMEncoder
@@ -32,7 +29,7 @@ from proteinqc.tools.codon_table import CodonTableManager
 from proteinqc.tools.orf_scanner import ORFScanner
 
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MODEL_DIR = PROJECT_ROOT / "models" / "calm"
 BENCHMARK_DIR = PROJECT_ROOT / "data" / "benchmark"
 RESULTS_DIR = PROJECT_ROOT / "data" / "results"

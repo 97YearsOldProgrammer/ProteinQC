@@ -1,0 +1,1 @@
+"""ProteinQC CLI entry points."""

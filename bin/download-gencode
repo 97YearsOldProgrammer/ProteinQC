@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Download GENCODE v49 reference data for evaluation and RL training.
 
 Downloads protein-coding transcripts, translations, lncRNA transcripts,
@@ -7,9 +8,9 @@ and annotation GTF from GENCODE FTP. These provide:
   - Ground truth: GTF annotation for CDS coordinate extraction
 
 Usage:
-    download-gencode                              # default: data/gencode/v49/
-    download-gencode --output-dir /path/to/data
-    download-gencode --release 46                 # specific release
+    python bin/download-gencode
+    python bin/download-gencode --output-dir /path/to/data
+    python bin/download-gencode --release 46
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
-_PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 GENCODE_FTP = "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human"
 

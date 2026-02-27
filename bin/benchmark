@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
 """Benchmark RNA classification heads."""
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
-
-from proteinqc.scripts.benchmark import main
+from proteinqc.cli.benchmark import main
 
 main()

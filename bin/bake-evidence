@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""Bake biological evidence offline for GRPO training."""
+from proteinqc.cli.bake_evidence import main
+
+main()

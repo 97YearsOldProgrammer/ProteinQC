@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""RNA Challenge re-test: compare CaLM input preprocessing strategies."""
+from proteinqc.cli.rna_challenge_retest import main
+
+main()

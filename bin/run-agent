@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""ProteinQC sequence analysis agent."""
+from proteinqc.cli.run_agent import main
+
+main()

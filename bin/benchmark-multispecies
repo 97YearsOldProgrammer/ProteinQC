@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""Multi-species CaLM benchmark on independent datasets."""
+from proteinqc.cli.benchmark_multispecies import main
+
+main()

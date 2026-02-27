@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from .tools.pfam_scanner import DomainHit, PfamScanner
     from .tools.riboformer_scorer import RiboformerScorer
 
-_PROJECT_ROOT = Path(__file__).parent.parent.parent
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_MODEL_DIR = _PROJECT_ROOT / "models" / "calm"
 _DEFAULT_HEAD_PATH = _PROJECT_ROOT / "models" / "heads" / "mlp_head_v1.pt"
 _DEFAULT_PFAM_DIR = _PROJECT_ROOT / "models" / "pfam"

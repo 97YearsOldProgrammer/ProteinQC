@@ -13,7 +13,6 @@ Uses pure PyTorch CaLM encoder — no multimolecule dependency.
 import argparse
 import csv
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -21,8 +20,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from proteinqc.data.tokenizer import CodonTokenizer
 from proteinqc.metrics.metrics import compute_metrics_from_logits
@@ -39,7 +36,7 @@ EPOCHS = 20
 SEED = 42
 TEST_RATIO = 0.2
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "rnachallenge"
 RESULTS_DIR = PROJECT_ROOT / "data" / "results"
 MODEL_DIR = PROJECT_ROOT / "models" / "calm"

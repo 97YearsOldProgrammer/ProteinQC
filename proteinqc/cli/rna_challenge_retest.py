@@ -12,7 +12,6 @@ Also score with pretrained MLPHead (zero-shot) for comparison.
 import csv
 import json
 import re
-import sys
 import time
 from pathlib import Path
 
@@ -20,8 +19,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from proteinqc.data.tokenizer import CodonTokenizer
 from proteinqc.models.calm_encoder import CaLMEncoder
@@ -38,7 +35,7 @@ EPOCHS = 20
 SEED = 42
 TEST_RATIO = 0.2
 
-_ROOT = Path(__file__).parent.parent.parent.parent
+_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = _ROOT / "data" / "rnachallenge"
 RESULTS_DIR = _ROOT / "data" / "results"
 MODEL_DIR = _ROOT / "models" / "calm"

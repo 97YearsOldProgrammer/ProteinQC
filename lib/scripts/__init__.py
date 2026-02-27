@@ -1,1 +1,0 @@
-"""ProteinQC command-line scripts."""

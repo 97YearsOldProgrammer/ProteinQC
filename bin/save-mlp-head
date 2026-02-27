@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""Train MLPHead and save weights to models/heads/."""
+from proteinqc.cli.save_mlp_head import main
+
+main()

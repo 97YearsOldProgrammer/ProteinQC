@@ -1,8 +1,6 @@
 """Quick verification: RiboformerPyTorch shape + param count (no weights needed)."""
 
-import sys
 import torch
-sys.path.insert(0, "/Users/gongchen/Code/ProteinQC")
 
 from proteinqc.tools.riboformer import RiboformerPyTorch, RiboformerConfig
 
