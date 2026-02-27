@@ -45,6 +45,10 @@ agent = [
     "mlx-lm>=0.25; sys_platform == 'darwin'",
     "psutil>=5.9.0",
 ]
+smolagents = [
+    "smolagents>=1.0.0",
+    "mlx-lm>=0.25; sys_platform == 'darwin'",
+]
 
 [project.scripts]
 download-calm = "proteinqc.scripts.download_calm:main"
@@ -56,9 +60,10 @@ download-pfam = "proteinqc.scripts.download_pfam:main"
 download-gencode = "proteinqc.scripts.download_gencode:main"
 train-agent = "proteinqc.scripts.train_agent:main"
 bake-evidence = "proteinqc.scripts.bake_evidence:main"
+run-agent = "proteinqc.scripts.run_agent:main"
 
 [tool.setuptools.packages.find]
-where = ["lib"]
+where = ["."]
 
 [tool.setuptools.package-data]
 "proteinqc.tools" = ["data/*.npz"]

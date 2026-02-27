@@ -343,6 +343,18 @@ class CaLMEncoder(nn.Module):
         """[CLS] embeddings [batch, hidden] from codon sequences."""
         return self._encode(input_ids, attention_mask)[:, 0, :]
 
+    def forward_mean_pool(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Mean-pooled embeddings [batch, hidden] over non-padding tokens."""
+        full = self._encode(input_ids, attention_mask)  # [B, S, H]
+        mask = attention_mask.unsqueeze(-1).to(full.dtype)  # [B, S, 1]
+        summed = (full * mask).sum(dim=1)  # [B, H]
+        lengths = mask.sum(dim=1).clamp(min=1)  # [B, 1]
+        return summed / lengths
+
     def forward_mlm(
         self,
         input_ids: torch.Tensor,

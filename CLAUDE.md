@@ -40,55 +40,67 @@ CaLM encoder (frozen) → [CLS] embedding (768-dim)
 
 ## Project Roadmap
 
-### Phase 1: Inference & Benchmarking (current)
+### Phase 1: Inference & Benchmarking (COMPLETE)
 - Load CaLM weights from safetensors (no transformers dependency)
 - Evaluate raw CaLM embeddings on RNA classification (coding vs non-coding)
-- Benchmark against existing tools from `doc/benchmark_report.tsv`
+- Benchmark against 24 published tools, 30+ species, ~70 dataset pairs
 - Implement gated LM head in pure `torch.nn`
-- Test on MPS backend, verify ANE compatibility path
+- Result: frozen CaLM + fresh MLP achieves ~87% avg accuracy zero-shot
 
-### Phase 2: SFT on Small Dataset
-- Curate small labeled dataset (coding/non-coding RNA sequences)
-- Supervised fine-tuning of the gated head (encoder frozen initially)
-- Optional: unfreeze top-N encoder layers for domain adaptation
-- Establish baseline metrics (ACC, PRE, REC, F1, MCC)
+### Phase 2: Multi-Signal Scoring System (current)
+- **Confusion matrix analysis**: classify all benchmark errors as TP/FP/TN/FN
+- **Feature engineering**: run all tool calls on benchmark sequences
+  - CaLM score, CaLM perplexity, ORF length, codon_tai, Pfam hits, GC content
+- **ML combiner**: XGBoost/scikit-learn on tool call features
+  - Goal: patch CaLM's weak spots (short seqs, certain species) with additional signals
+  - SHAP analysis to identify which tools matter most per failure mode
+- **Key insight**: CaLM encoder stays frozen forever — intelligence is in the routing
 
-### Phase 3: Reinforcement Learning
-- Define reward function using existing QC tool signals:
-  - mRNA stability (RNAdegformer)
-  - Translation efficiency (Riboformer)
-  - Protein solubility (NetSolP)
-  - Protein half-life (PLTNUM)
-  - Degron detection (deepDegron)
-- MCTS for ORF search space exploration (different AUG starts, stop codons, reading frames)
-- Self-play or adversarial scoring dynamics
+### Phase 3: Tool-Use Agent (ReAct)
+- **Tool-calling policy**: agent learns WHEN to call which tools
+  - Short ambiguous ORF → call Pfam + codon_tai
+  - Long clear coding seq → CaLM score alone suffices, skip expensive tools
+- **RL on tool-use policy**: GRPO/PPO to optimize tool selection efficiency
+  - Reward = classification accuracy + tool call cost penalty
+  - DeepSeek-R1 / web-agent playbook applied to bioinformatics
+- **Framework**: HuggingFace-compatible pipeline
+  - `transformers` API for CaLM inference
+  - Tool-calling agent as separate module
+  - Ship as `pip install proteinqc`
 
-### Phase 4: Chain-of-Thought SFT
-- Distill RL-learned reasoning into explicit chain-of-thought traces
-- SFT on (sequence, reasoning chain, prediction) triples
-- Goal: interpretable model that explains WHY a sequence is coding/non-coding
-- Portable encoder that internalizes multi-signal QC scoring
+### Design Principles
+- **CaLM is never fine-tuned** — 85.75M params frozen, pretrained representations are strong enough
+- **Scoring system is lightweight ML** — XGBoost on ~8-12 scalar features, not deep learning
+- **Agent learns routing, not biology** — which tools to call, not how to interpret sequences
+- **Short ORFs are the key failure mode** — additional signals (Pfam, codon usage) compensate
 
 ## Dependencies
 
-### Core (required now)
+### Core
 ```
 torch>=2.0          # MPS backend for Apple Silicon
 safetensors         # CaLM weight loading
 huggingface_hub     # Model downloads
 ```
 
-### Phase 2+ (SFT and beyond)
+### Phase 2 (scoring system)
 ```
-multimolecule       # HuggingFace-compatible CaLM wrapper
-datasets            # HuggingFace datasets for training data
-accelerate          # Training utilities
+scikit-learn        # ML combiner, logistic regression baseline
+xgboost             # Gradient boosted trees for tabular features
+shap                # Feature importance analysis
+pandas              # Feature table management
+```
+
+### Phase 3 (agent)
+```
+trl                 # GRPO training for tool-use policy
+peft                # LoRA adapters for agent LLM
+transformers        # HuggingFace pipeline integration
 ```
 
 ### Optional (deployment)
 ```
 coremltools         # Convert to CoreML for ANE inference
-ane_transformers    # ANE-optimized transformer blocks
 mlx                 # Apple-native ML framework alternative
 ```
 
