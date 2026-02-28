@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
-    {name = "Gong Chen", email = "gongchen@example.com"}
+    {name = "Gong Chen", email = "dsbchen@ucdavis.edu"}
 ]
 keywords = ["RNA", "protein", "CaLM", "classification", "deep-learning"]
 

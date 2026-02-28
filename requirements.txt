@@ -1,0 +1,14 @@
+# ProteinQC dependencies (for Docker auto-install)
+# Core
+safetensors
+huggingface-hub>=0.20.0
+biopython
+python-codon-tables
+
+# Features (Phase 2)
+pandas
+pyarrow
+tqdm
+
+# System packages needed (install via apt):
+#   hmmer  — for Pfam domain scanning

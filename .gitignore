@@ -8,15 +8,27 @@ __pycache__/
 dist/
 build/
 
-# Models & Data (large files)
+# Models (large binary weights)
 models/calm/*.safetensors
 models/heads/*.pt
+models/riboformer/*.pt
+models/pfam/
+
+# Data (large / generated / downloadable)
+data/gencode/*.fa.gz
 data/rnachallenge/*.fa
 data/rnachallenge/*.tsv
 data/rnachallenge/evidence_baked.jsonl
 data/supplements/*.zip
 data/benchmark/
 data/ProteinQC/
+data/features/*.parquet
+
+# Intermediate / large generated results
+data/results/*_log.txt
+data/results/*_partial.json
+data/results/retest_log.txt
+data/results/rna_challenge_retest.json
 
 # Jupyter
 .ipynb_checkpoints/
@@ -38,3 +50,7 @@ Thumbs.db
 # Cache
 .cache/
 *.cache
+
+# Environment
+.env
+*.env
