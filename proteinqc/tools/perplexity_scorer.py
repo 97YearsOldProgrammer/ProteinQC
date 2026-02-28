@@ -18,6 +18,7 @@ import torch
 
 from proteinqc.data.tokenizer import PAD_ID
 
+# Conservative defaults for MPS/CPU; CUDA auto-scales in __init__
 TOKEN_BUDGET = 8_192
 BATCH_MAX = 16
 
@@ -54,6 +55,14 @@ class PerplexityScorer:
             self.model_dir, freeze=True, load_lm_head=True
         ).to(self.device)
         self.encoder.train(False)
+
+        # CUDA with large VRAM: batch aggressively
+        if self.device.type == "cuda":
+            self._token_budget = 131_072  # 16x default
+            self._batch_max = 512
+        else:
+            self._token_budget = TOKEN_BUDGET
+            self._batch_max = BATCH_MAX
 
     def score_one(self, sequence: str) -> float:
         """Compute pseudo-perplexity for a single DNA sequence.
@@ -127,8 +136,8 @@ class PerplexityScorer:
         log_probs = torch.zeros(n)
 
         # Adaptive batching based on sequence length
-        adaptive_bs = max(1, TOKEN_BUDGET // seq_len)
-        adaptive_bs = min(adaptive_bs, BATCH_MAX, n)
+        adaptive_bs = max(1, self._token_budget // seq_len)
+        adaptive_bs = min(adaptive_bs, self._batch_max, n)
 
         i = 0
         while i < n:

@@ -15,6 +15,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import load_file
 
+try:
+    from flash_attn import flash_attn_func
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
+
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate pairs: [-x2, x1] for RoPE."""
@@ -117,13 +123,22 @@ class TransformerLayer(nn.Module):
 
         q, k = _apply_rope(q, k, cos, sin)
 
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_dropout_p if self.training else 0.0,
-        )
-        # [batch, heads, seq, head_dim] → [batch, seq, hidden]
-        attn_out = attn_out.transpose(1, 2).contiguous().view(x.shape)
+        if _HAS_FLASH_ATTN and q.is_cuda:
+            # flash_attn expects [B, S, H, D] in float16/bfloat16
+            fa_dtype = torch.bfloat16
+            q = q.transpose(1, 2).to(fa_dtype)
+            k = k.transpose(1, 2).to(fa_dtype)
+            v = v.transpose(1, 2).to(fa_dtype)
+            attn_out = flash_attn_func(q, k, v, causal=False)
+            attn_out = attn_out.to(x.dtype).reshape(x.shape)
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout_p if self.training else 0.0,
+            )
+            # [batch, heads, seq, head_dim] → [batch, seq, hidden]
+            attn_out = attn_out.transpose(1, 2).contiguous().view(x.shape)
         attn_out = self.hidden_dropout1(self.out_proj(attn_out))
         x = x + attn_out
 
@@ -314,26 +329,34 @@ class CaLMEncoder(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Encoder forward pass → hidden states [batch, seq, hidden]."""
+        """Encoder forward pass → hidden states [batch, seq, hidden].
+
+        On CUDA: runs in bfloat16 via autocast (FlashAttention + fast matmuls).
+        On MPS/CPU: runs in float32 with SDPA fallback.
+        """
         device = input_ids.device
         seq_len = input_ids.shape[1]
+        use_autocast = device.type == "cuda"
 
         if attention_mask is None:
             attention_mask = input_ids.ne(self.config["pad_token_id"]).long()
 
-        x = self.word_embeddings(input_ids)
-        x = x * attention_mask.unsqueeze(-1).to(x.dtype)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_autocast):
+            x = self.word_embeddings(input_ids)
+            x = x * attention_mask.unsqueeze(-1).to(x.dtype)
 
-        sdpa_mask = attention_mask[:, None, None, :].bool()  # [B,1,1,S] for SDPA broadcast
+            sdpa_mask = attention_mask[:, None, None, :].bool()  # [B,1,1,S] for SDPA
 
-        self._ensure_rope(seq_len, device)
-        cos = self._rope_cos.to(device=device, dtype=x.dtype)
-        sin = self._rope_sin.to(device=device, dtype=x.dtype)
+            self._ensure_rope(seq_len, device)
+            cos = self._rope_cos.to(device=device, dtype=x.dtype)
+            sin = self._rope_sin.to(device=device, dtype=x.dtype)
 
-        for layer in self.layers:
-            x = layer(x, sdpa_mask, cos, sin)
+            for layer in self.layers:
+                x = layer(x, sdpa_mask, cos, sin)
 
-        return self.emb_layer_norm_after(x)
+            x = self.emb_layer_norm_after(x)
+
+        return x.float() if use_autocast else x
 
     def forward(
         self,

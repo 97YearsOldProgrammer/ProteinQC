@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# Run feature extraction (skip perplexity) on all benchmark datasets
+# Designed to run INSIDE the gt5 container on DGX Spark
+#
+# Usage: bash run-all-features [--include-perplexity]
+#
+
+set -euo pipefail
+
+cd /workspace/Code/ProteinQC
+
+SKIP_PPL="--skip-perplexity"
+if [[ "${1:-}" == "--include-perplexity" ]]; then
+    SKIP_PPL=""
+    echo "Including perplexity (SLOW)"
+fi
+
+PFAM_DB="models/pfam/Pfam-A.hmm"
+PFAM_FLAG=""
+if [[ -f "$PFAM_DB" ]]; then
+    PFAM_FLAG="--pfam --pfam-db $PFAM_DB"
+    echo "Pfam database found: $PFAM_DB"
+else
+    echo "WARNING: Pfam database not found, skipping Pfam"
+fi
+
+OUT_DIR="data/features"
+mkdir -p "$OUT_DIR"
+
+echo "========================================"
+echo "Feature extraction: all benchmark datasets"
+echo "Skip perplexity: ${SKIP_PPL:+YES}"
+echo "Pfam: ${PFAM_FLAG:+YES}"
+echo "Output: $OUT_DIR/"
+echo "========================================"
+
+# Process each benchmark tool directory
+for dir in data/benchmark/*/; do
+    tool=$(basename "$dir")
+
+    # Check for _pc/_nc FASTA pairs
+    pairs=$(ls "$dir"*_pc* "$dir"*_nc* 2>/dev/null | wc -l)
+    if [[ "$pairs" -lt 2 ]]; then
+        echo "SKIP $tool (no _pc/_nc pairs found)"
+        continue
+    fi
+
+    echo ""
+    echo "--- $tool ---"
+    python -m proteinqc.cli.extract_features \
+        --fasta-dir "$dir" \
+        --output-dir "$OUT_DIR" \
+        $SKIP_PPL \
+        $PFAM_FLAG \
+        2>&1 || echo "ERROR: $tool failed"
+done
+
+echo ""
+echo "========================================"
+echo "ALL DONE"
+echo "Output files:"
+ls -lh "$OUT_DIR"/*.parquet 2>/dev/null
+echo "========================================"

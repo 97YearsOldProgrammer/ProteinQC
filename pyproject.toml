@@ -49,6 +49,11 @@ smolagents = [
     "smolagents>=1.0.0",
     "mlx-lm>=0.25; sys_platform == 'darwin'",
 ]
+features = [
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "tqdm>=4.60",
+]
 
 [project.scripts]
 benchmark = "proteinqc.cli.benchmark:main"
@@ -58,6 +63,7 @@ save-mlp-head = "proteinqc.cli.save_mlp_head:main"
 bake-evidence = "proteinqc.cli.bake_evidence:main"
 train-agent = "proteinqc.cli.train_agent:main"
 run-agent = "proteinqc.cli.run_agent:main"
+extract-features = "proteinqc.cli.extract_features:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,6 +1,7 @@
-"""CaLM-based ORF scorer using frozen encoder + trained MLP head.
+"""CaLM-based ORF scorer using frozen encoder + classification head.
 
-Wraps CaLMEncoder (frozen) + MLPHead (pre-trained) for scoring ORF candidates.
+Wraps CaLMEncoder (frozen) + classification head (GatedHead or MLPHead)
+for scoring ORF candidates. Head type auto-detected from state dict keys.
 Uses TOKEN_BUDGET=8192 adaptive batching (same pattern as benchmark.py).
 Model loaded once on construction, reused across all calls.
 """
@@ -33,7 +34,6 @@ class CaLMScorer:
     ):
         from proteinqc.data.tokenizer import CodonTokenizer
         from proteinqc.models.calm_encoder import CaLMEncoder
-        from proteinqc.models.classification_heads import MLPHead
 
         self.device = device or _select_device()
         self.model_dir = Path(model_dir)
@@ -44,10 +44,10 @@ class CaLMScorer:
         self.encoder = CaLMEncoder(self.model_dir, freeze=True).to(self.device)
         self.encoder.train(False)  # inference mode
 
-        self.head = MLPHead(hidden_size=768, mlp_hidden=256, dropout=0.0)
         state = torch.load(
             self.head_weights_path, map_location=self.device, weights_only=True
         )
+        self.head = _build_head(state)
         self.head.load_state_dict(state)
         self.head = self.head.to(self.device)
         self.head.train(False)  # inference mode
@@ -102,6 +102,15 @@ class CaLMScorer:
             i += adaptive_bs
 
         return scores
+
+
+def _build_head(state_dict: dict[str, torch.Tensor]) -> torch.nn.Module:
+    """Auto-detect head type from state dict keys and build matching module."""
+    from proteinqc.models.classification_heads import GatedHead, MLPHead
+
+    if any(k.startswith("gate.") for k in state_dict):
+        return GatedHead(hidden_size=768, mlp_hidden=256, dropout=0.0)
+    return MLPHead(hidden_size=768, mlp_hidden=256, dropout=0.0)
 
 
 def _select_device() -> torch.device:

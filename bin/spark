@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# spark — DGX Spark management from Mac
+#
+# Usage:
+#   spark status                  # check both machines
+#   spark exec "python ..."       # run on spark-1089
+#   spark exec --worker "..."     # run on spark-0b7c
+#   spark exec --both "..."       # run on both (parallel)
+#   spark scp-results             # pull data/features/*.parquet back to Mac
+#   spark setup                   # install deps in both containers
+#
+
+set -euo pipefail
+
+KEY="/Users/gongchen/Library/Application Support/NVIDIA/Sync/config/nvsync.key"
+MASTER="cg666@spark-1089.local"
+WORKER="cg666@spark-0b7c.local"
+CONTAINER="gt5"
+REMOTE_DIR="/workspace/Code/ProteinQC"
+
+ssh_cmd() {
+    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i "$KEY" "$@"
+}
+
+docker_run() {
+    local host=$1; shift
+    ssh_cmd "$host" "docker exec $CONTAINER bash -c 'cd $REMOTE_DIR && $*'"
+}
+
+cmd_status() {
+    echo "=== spark-1089 (master) ==="
+    ssh_cmd "$MASTER" "nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null; docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null" || echo "  UNREACHABLE"
+    echo ""
+    echo "=== spark-0b7c (worker) ==="
+    ssh_cmd "$WORKER" "nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null; docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null" || echo "  UNREACHABLE"
+}
+
+cmd_run() {
+    local target="master"
+    local command=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --worker) target="worker"; shift ;;
+            --both)   target="both"; shift ;;
+            *)        command="$*"; break ;;
+        esac
+    done
+
+    if [[ -z "$command" ]]; then
+        echo "Usage: spark exec [--worker|--both] \"command\"" >&2
+        return 1
+    fi
+
+    case "$target" in
+        master)
+            echo "[spark-1089] $command"
+            docker_run "$MASTER" "$command"
+            ;;
+        worker)
+            echo "[spark-0b7c] $command"
+            docker_run "$WORKER" "$command"
+            ;;
+        both)
+            echo "[spark-1089] $command"
+            docker_run "$MASTER" "$command" &
+            local pid1=$!
+            echo "[spark-0b7c] $command"
+            docker_run "$WORKER" "$command" &
+            local pid2=$!
+            wait $pid1 $pid2
+            ;;
+    esac
+}
+
+cmd_setup() {
+    echo "Installing deps on both containers..."
+    for host in "$MASTER" "$WORKER"; do
+        local name
+        [[ "$host" == "$MASTER" ]] && name="spark-1089" || name="spark-0b7c"
+        echo "=== $name ==="
+        docker_run "$host" "
+            pip install -q safetensors huggingface-hub biopython python-codon-tables pandas pyarrow tqdm 2>&1 | tail -2
+            apt-get update -qq && apt-get install -y -qq hmmer 2>&1 | tail -1
+            pip install -q -e . 2>&1 | tail -1
+            python3 -c 'import proteinqc; print(f\"proteinqc OK\")'
+        "
+    done
+}
+
+cmd_scp_results() {
+    local local_dir="/Users/gongchen/Code/ProteinQC/data/features/"
+    echo "Pulling parquet files from both Sparks..."
+    scp -i "$KEY" "$MASTER:/home/cg666/Code/ProteinQC/data/features/*.parquet" "$local_dir" 2>/dev/null && echo "  spark-1089: OK" || echo "  spark-1089: no parquets"
+    scp -i "$KEY" "$WORKER:/home/cg666/Code/ProteinQC/data/features/*.parquet" "$local_dir" 2>/dev/null && echo "  spark-0b7c: OK" || echo "  spark-0b7c: no parquets"
+    echo "Local parquets:"
+    ls -lh "$local_dir"*.parquet 2>/dev/null || echo "  none"
+}
+
+# --- Main ---
+case "${1:-help}" in
+    status)      cmd_status ;;
+    exec)        shift; cmd_run "$@" ;;
+    setup)       cmd_setup ;;
+    scp-results) cmd_scp_results ;;
+    *)
+        echo "Usage: spark {status|exec|setup|scp-results}"
+        echo ""
+        echo "  status         Check GPU/container status on both machines"
+        echo "  exec CMD       Run command in master container"
+        echo "  exec --worker  Run command in worker container"
+        echo "  exec --both    Run command on both (parallel)"
+        echo "  setup          Install all deps in both containers"
+        echo "  scp-results    Pull parquet files back to Mac"
+        ;;
+esac

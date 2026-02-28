@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Extract features for all benchmark datasets.
+# Uses --fasta-dir bulk mode: single CaLM session for all pairs.
+#
+# Usage:
+#   bin/extract-all-features              # CPU-only (fast, ~2s)
+#   bin/extract-all-features --with-gpu   # include CaLM (~5 min)
+set -euo pipefail
+
+GPU_FLAG="--skip-gpu"
+if [[ "${1:-}" == "--with-gpu" ]]; then
+    GPU_FLAG="--skip-perplexity"
+fi
+
+# NCResNet short: 8 species, 11970 seqs, single CaLM session
+echo "=== NCResNet short sequences ==="
+python -m proteinqc.cli.extract_features \
+    --fasta-dir data/benchmark/ncresnet/ \
+    --filter "*short*" \
+    --output-dir data/features/ \
+    $GPU_FLAG
+
+# RNA Challenge: 27283 seqs, reuses pre-baked CaLM scores
+JSONL="data/rnachallenge/evidence_baked.jsonl"
+if [[ -f "$JSONL" ]]; then
+    echo ""
+    echo "=== RNA Challenge ==="
+    python -m proteinqc.cli.extract_features \
+        --jsonl "$JSONL" \
+        --dataset "RNAChallenge" \
+        --skip-perplexity \
+        --output data/features/rna_challenge.parquet
+fi
+
+echo ""
+echo "All done:"
+ls -lh data/features/*.parquet 2>/dev/null
