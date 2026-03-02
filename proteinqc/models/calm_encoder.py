@@ -220,7 +220,7 @@ class CaLMEncoder(nn.Module):
         # Final LayerNorm (applied after all transformer layers)
         self.emb_layer_norm_after = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
 
-        # Optional LM head for MLM / perplexity scoring
+        # Optional LM head for MLM tasks
         self.lm_head: Optional[CaLMLMHead] = None
         if load_lm_head:
             self.lm_head = CaLMLMHead(

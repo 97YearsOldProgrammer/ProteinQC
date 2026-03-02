@@ -162,40 +162,6 @@ class CaLMScorerTool(Tool):
         return scores[0]
 
 
-class PerplexityScorerTool(Tool):
-    """Compute pseudo-perplexity of a DNA sequence using CaLM's LM head.
-
-    Lower perplexity means more natural codon usage patterns (likely coding).
-    The CaLM model is loaded lazily on first call.
-    """
-
-    name = "calm_perplexity"
-    description = (
-        "Compute pseudo-perplexity (PPPL) of a DNA sequence using CaLM's masked "
-        "language model head. Lower values indicate more natural codon usage patterns "
-        "(stronger coding signal). Higher values suggest non-coding or spurious ORFs."
-    )
-    inputs = {
-        "sequence": {
-            "type": "string",
-            "description": "DNA sequence (A/T/G/C characters) to score.",
-        }
-    }
-    output_type = "number"
-
-    def __init__(self, model_dir: str = "models/calm"):
-        super().__init__()
-        self._model_dir = model_dir
-        self._scorer = None
-
-    def forward(self, sequence: str) -> float:
-        if self._scorer is None:
-            from proteinqc.tools.perplexity_scorer import PerplexityScorer
-
-            self._scorer = PerplexityScorer(self._model_dir)
-        return self._scorer.score_one(sequence)
-
-
 class PfamScannerTool(Tool):
     """Scan a protein sequence against the Pfam-A HMM database for known domains.
 

@@ -1,37 +1,138 @@
 #!/usr/bin/env bash
-# Extract features for all benchmark datasets.
-# Uses --fasta-dir bulk mode: single CaLM session for all pairs.
 #
-# Usage:
-#   bin/extract-all-features              # CPU-only (fast, ~2s)
-#   bin/extract-all-features --with-gpu   # include CaLM (~5 min)
-set -euo pipefail
+# One-click distributed feature extraction across two DGX Sparks
+#
+# Usage (from Mac):
+#   bin/extract-all-features
+#
+# What it does:
+#   1. SSHes into both DGX Spark containers
+#   2. Launches extract_features --benchmark-root with --nnodes 2 --node-rank {0,1}
+#   3. Greedy bin-packing inside Python assigns tools to nodes by FASTA size
+#   4. Both write to shared data/features/ dir (NVIDIA Sync)
+#   5. Waits for both, prints combined summary
+#
+# Prerequisites:
+#   - Both Sparks running gt5 container
+#   - proteinqc installed (pip install -e .) in both containers
+#   - SSH key at $KEY path
+#
 
-GPU_FLAG="--skip-gpu"
-if [[ "${1:-}" == "--with-gpu" ]]; then
-    GPU_FLAG="--skip-perplexity"
-fi
+set -e
 
-# NCResNet short: 8 species, 11970 seqs, single CaLM session
-echo "=== NCResNet short sequences ==="
-python -m proteinqc.cli.extract_features \
-    --fasta-dir data/benchmark/ncresnet/ \
-    --filter "*short*" \
-    --output-dir data/features/ \
-    $GPU_FLAG
+KEY="/Users/gongchen/Library/Application Support/NVIDIA/Sync/config/nvsync.key"
+SPARK1="cg666@spark-1089.local"
+SPARK2="cg666@spark-0b7c.local"
+CONTAINER="gt5"
+WORKDIR="/workspace/Code/ProteinQC"
+LOGDIR="/workspace/Code/ProteinQC/data/features"
 
-# RNA Challenge: 27283 seqs, reuses pre-baked CaLM scores
-JSONL="data/rnachallenge/evidence_baked.jsonl"
-if [[ -f "$JSONL" ]]; then
+# Pfam DB location (on DGX)
+PFAM_DB="models/pfam/Pfam-A.hmm"
+
+ssh_cmd() {
+    ssh -i "$KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$@"
+}
+
+echo "============================================================"
+echo "    ProteinQC Distributed Feature Extraction (2 nodes)"
+echo "============================================================"
+echo "  Node 0: spark-1089"
+echo "  Node 1: spark-0b7c"
+echo "  Container: ${CONTAINER}"
+echo "============================================================"
+echo ""
+
+# --- Check connectivity ---
+echo "Checking connectivity..."
+for host in "$SPARK1" "$SPARK2"; do
+    RUNNING=$(ssh_cmd "$host" "docker inspect -f '{{.State.Running}}' $CONTAINER 2>/dev/null" || echo "false")
+    if [ "$RUNNING" = "true" ]; then
+        echo "  [OK] $host ($CONTAINER running)"
+    else
+        echo "  [FAIL] $host ($CONTAINER not running)"
+        exit 1
+    fi
+done
+
+# --- Ensure proteinqc is installed ---
+echo ""
+echo "Checking proteinqc installation..."
+for host in "$SPARK1" "$SPARK2"; do
+    if ssh_cmd "$host" "docker exec $CONTAINER python -c 'import proteinqc'" 2>/dev/null; then
+        echo "  [OK] $host"
+    else
+        echo "  [INSTALL] $host — pip install -e ."
+        ssh_cmd "$host" "docker exec $CONTAINER bash -c 'cd $WORKDIR && pip install -e . -q'"
+    fi
+done
+
+# --- Check Pfam DB ---
+PFAM_FLAG=""
+if ssh_cmd "$SPARK1" "docker exec $CONTAINER test -f $WORKDIR/$PFAM_DB" 2>/dev/null; then
+    PFAM_FLAG="--pfam --pfam-db $PFAM_DB"
     echo ""
-    echo "=== RNA Challenge ==="
-    python -m proteinqc.cli.extract_features \
-        --jsonl "$JSONL" \
-        --dataset "RNAChallenge" \
-        --skip-perplexity \
-        --output data/features/rna_challenge.parquet
+    echo "  [OK] Pfam DB found: $PFAM_DB"
+else
+    echo ""
+    echo "  [WARN] Pfam DB not found, skipping Pfam"
 fi
+
+# --- Build the extract command ---
+EXTRACT_CMD="cd $WORKDIR && python -m proteinqc.cli.extract_features --benchmark-root data/benchmark --output-dir data/features $PFAM_FLAG"
+
+# --- Launch Node 1 (worker) ---
+echo ""
+echo "[node 1] Launching on spark-0b7c..."
+LOG1="$LOGDIR/node1.log"
+ssh_cmd "$SPARK2" \
+    "docker exec $CONTAINER bash -c '$EXTRACT_CMD --nnodes 2 --node-rank 1 > $LOG1 2>&1'" &
+WORKER_PID=$!
+
+sleep 2
+
+# --- Launch Node 0 (master) ---
+echo "[node 0] Launching on spark-1089..."
+LOG0="$LOGDIR/node0.log"
+ssh_cmd "$SPARK1" \
+    "docker exec $CONTAINER bash -c '$EXTRACT_CMD --nnodes 2 --node-rank 0 > $LOG0 2>&1'" &
+HOST_PID=$!
 
 echo ""
-echo "All done:"
-ls -lh data/features/*.parquet 2>/dev/null
+echo "Both nodes running. Logs:"
+echo "  Node 0: ssh into spark-1089, docker exec gt5 tail -f $LOG0"
+echo "  Node 1: ssh into spark-0b7c, docker exec gt5 tail -f $LOG1"
+echo ""
+echo "Waiting for completion..."
+
+# --- Wait for both ---
+HOST_EXIT=0
+WORKER_EXIT=0
+wait $HOST_PID   || HOST_EXIT=$?
+wait $WORKER_PID || WORKER_EXIT=$?
+
+echo ""
+echo "============================================================"
+echo "  Distributed Feature Extraction Complete"
+echo "============================================================"
+echo "  Node 0 (spark-1089): exit=${HOST_EXIT}"
+echo "  Node 1 (spark-0b7c): exit=${WORKER_EXIT}"
+
+# --- Show node logs tail ---
+echo ""
+echo "  Node 0 log (last 15 lines):"
+ssh_cmd "$SPARK1" "docker exec $CONTAINER tail -15 $LOG0" 2>/dev/null || true
+echo ""
+echo "  Node 1 log (last 15 lines):"
+ssh_cmd "$SPARK2" "docker exec $CONTAINER tail -15 $LOG1" 2>/dev/null || true
+
+# --- Show output files ---
+echo ""
+echo "  Output parquets:"
+ssh_cmd "$SPARK1" "docker exec $CONTAINER ls -lh $WORKDIR/data/features/*.parquet" 2>/dev/null || true
+
+echo "============================================================"
+
+if [ $HOST_EXIT -ne 0 ] || [ $WORKER_EXIT -ne 0 ]; then
+    exit 1
+fi

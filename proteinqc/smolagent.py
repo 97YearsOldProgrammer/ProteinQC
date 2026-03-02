@@ -11,7 +11,6 @@ from smolagents import CodeAgent
 
 from proteinqc.smolagents_tools import (
     CaLMScorerTool,
-    PerplexityScorerTool,
     PfamScannerTool,
     gc_content,
     kozak_score,
@@ -29,7 +28,6 @@ You have access to tools for analyzing DNA/RNA sequences:
 - gc_content: Measure GC content of a sequence
 - kozak_score: Evaluate translation initiation context
 - calm_score: Score coding potential with CaLM neural network
-- calm_perplexity: Measure codon usage naturalness
 - pfam_scan: Search for known protein domains
 
 When analyzing a sequence, consider:
@@ -73,7 +71,7 @@ def create_agent(
     backend: str = "mlx",
     model_id: str = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
     model_dir: str = "models/calm",
-    head_path: str = "models/heads/mlp_head_v1.pt",
+    head_path: str = "models/heads/gated_head_v1.pt",
     pfam_db: str = "models/pfam/Pfam-A.hmm",
     verbose: bool = False,
 ) -> CodeAgent:
@@ -99,7 +97,6 @@ def create_agent(
         gc_content,
         kozak_score,
         CaLMScorerTool(model_dir=model_dir, head_path=head_path),
-        PerplexityScorerTool(model_dir=model_dir),
         PfamScannerTool(pfam_db_path=pfam_db),
     ]
 

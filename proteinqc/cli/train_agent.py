@@ -95,7 +95,7 @@ def _save_config(args: argparse.Namespace, output_dir: Path, train_size: int, te
         "max_tools_per_episode": args.max_tools,
         "warmup_ratio": args.warmup_ratio,
         "seed": args.seed,
-        "tools_enabled": ["score_coding_potential", "score_perplexity", "translate_orf"]
+        "tools_enabled": ["score_coding_potential", "translate_orf"]
         + (["scan_domains"] if args.pfam_db and Path(args.pfam_db).exists() else []),
         "riboformer_enabled": False,
         "baseline_acc": 0.9562,

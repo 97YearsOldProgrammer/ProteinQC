@@ -1,8 +1,8 @@
 """Pre-baked evidence data structures and loaders.
 
-Evidence (CaLM score, perplexity, translation, Pfam domains) is computed
-offline via `bake-evidence` and stored as JSONL. This module loads it
-into typed dataclasses for the v2 GRPO trainer.
+Evidence (CaLM score, translation, Pfam domains) is computed offline
+via `bake-evidence` and stored as JSONL. This module loads it into
+typed dataclasses for the v2 GRPO trainer.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ class BakedEvidence:
         sequence: Raw DNA sequence (T not U).
         label: Ground truth — "coding" or "noncoding".
         calm_score: CaLM coding probability in [0, 1], or None if skipped.
-        perplexity: CaLM pseudo-perplexity, or None if skipped.
         translation: Amino acid sequence from translate(), or None.
         pfam_domains: List of domain hit strings, or empty list.
     """
@@ -35,7 +34,6 @@ class BakedEvidence:
     label: str
     species: str = "unknown"
     calm_score: float | None = None
-    perplexity: float | None = None
     translation: str | None = None
     pfam_domains: tuple[str, ...] = field(default_factory=tuple)
 
@@ -62,7 +60,6 @@ class BakedEvidence:
             "label": self.label,
             "species": self.species,
             "calm_score": self.calm_score,
-            "perplexity": self.perplexity,
             "translation": self.translation,
             "pfam_domains": list(self.pfam_domains),
         }
@@ -105,7 +102,6 @@ def load_baked_evidence(path: Path | str) -> list[BakedEvidence]:
                     label=obj["label"],
                     species=obj.get("species", "unknown"),
                     calm_score=obj.get("calm_score"),
-                    perplexity=obj.get("perplexity"),
                     translation=obj.get("translation"),
                     pfam_domains=tuple(obj.get("pfam_domains", [])),
                 )

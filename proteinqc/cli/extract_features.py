@@ -13,10 +13,10 @@ Three input modes:
         --fasta-dir data/benchmark/ncresnet/ --filter "*short*" \
         --output-dir data/features/
 
-    # JSONL (reuses pre-baked CaLM/perplexity)
+    # JSONL (reuses pre-baked CaLM scores)
     python -m proteinqc.cli.extract_features \
         --jsonl data/rnachallenge/evidence_baked.jsonl \
-        --dataset "RNAChallenge" --skip-perplexity \
+        --dataset "RNAChallenge" \
         --output data/features/rna_challenge.parquet
 """
 
@@ -87,7 +87,6 @@ def _load_jsonl(jsonl_path: Path, dataset: str) -> list[dict]:
                 "dataset": dataset,
                 "species": obj.get("species", "unknown"),
                 "_calm_score": obj.get("calm_score"),
-                "_perplexity": obj.get("perplexity"),
             })
     return items
 
@@ -190,8 +189,7 @@ def _cpu_features_parallel(sequences: list[str], n_workers: int) -> list[dict]:
 FEATURE_COLS = [
     "seq_length_bp", "gc_content", "longest_orf_codons", "num_orfs",
     "orf_fraction", "kozak_score", "protein_length", "codon_entropy",
-    "codon_gini", "calm_score", "perplexity", "num_pfam_domains",
-    "best_pfam_evalue",
+    "codon_gini", "calm_score", "num_pfam_domains", "best_pfam_evalue",
 ]
 
 
@@ -200,17 +198,28 @@ def _run(items: list[dict], args: argparse.Namespace,
     """Process items: Tier 1 (CPU parallel), Tier 2 (GPU batched), write parquets."""
     import pandas as pd
 
-    # Incremental resume across all outputs
-    done_ids: set[str] = set()
-    for path in output_map.values():
-        if path.exists():
-            done_ids.update(pd.read_parquet(path)["sequence_id"])
-    if done_ids:
-        items = [it for it in items if it["sequence_id"] not in done_ids]
-        print(f"  Resuming: {len(done_ids)} done, {len(items)} remaining", flush=True)
-    if not items:
-        print("  All done.", flush=True)
-        return
+    # In pfam-update mode: inject existing CaLM scores, skip resume
+    if getattr(args, "pfam_update", False):
+        print("  Pfam-update mode: injecting existing CaLM scores", flush=True)
+        for path in output_map.values():
+            if path.exists():
+                existing = pd.read_parquet(path)
+                score_map = dict(zip(existing["sequence_id"], existing["calm_score"]))
+                for it in items:
+                    if it["sequence_id"] in score_map:
+                        it["_calm_score"] = score_map[it["sequence_id"]]
+    else:
+        # Incremental resume across all outputs
+        done_ids: set[str] = set()
+        for path in output_map.values():
+            if path.exists():
+                done_ids.update(pd.read_parquet(path)["sequence_id"])
+        if done_ids:
+            items = [it for it in items if it["sequence_id"] not in done_ids]
+            print(f"  Resuming: {len(done_ids)} done, {len(items)} remaining", flush=True)
+        if not items:
+            print("  All done.", flush=True)
+            return
 
     sequences = [it["sequence"] for it in items]
     n = len(items)
@@ -226,21 +235,18 @@ def _run(items: list[dict], args: argparse.Namespace,
     timings["tier1_cpu"] = dt
     print(f"  {dt:.2f}s  ({n / dt:.0f} seq/s)", flush=True)
 
-    # --- Tier 2: GPU ---
+    # --- Tier 2: GPU (CaLM scoring) ---
     calm_scores: list[float | None] = [None] * n
-    ppl_scores: list[float | None] = [None] * n
 
     if not args.skip_gpu:
         prebaked_calm = [it.get("_calm_score") for it in items]
-        prebaked_ppl = [it.get("_perplexity") for it in items]
         need_calm = [i for i, v in enumerate(prebaked_calm) if v is None]
-        need_ppl = [i for i, v in enumerate(prebaked_ppl) if v is None]
 
         calm_dir = Path(args.calm_dir)
         head_path = Path(args.head_path)
 
         if need_calm and (calm_dir / "model.safetensors").exists() and head_path.exists():
-            print(f"\nTier 2a CaLM scoring  ({len(need_calm)} seqs)", flush=True)
+            print(f"\nTier 2  CaLM scoring  ({len(need_calm)} seqs)", flush=True)
             from proteinqc.tools.calm_scorer import CaLMScorer
 
             scorer = CaLMScorer(calm_dir, head_path)
@@ -259,25 +265,6 @@ def _run(items: list[dict], args: argparse.Namespace,
         for i, v in enumerate(prebaked_calm):
             if v is not None:
                 calm_scores[i] = v
-
-        if not args.skip_perplexity and need_ppl:
-            if (calm_dir / "model.safetensors").exists():
-                print(f"\nTier 2b Perplexity    ({len(need_ppl)} seqs)", flush=True)
-                from proteinqc.tools.perplexity_scorer import PerplexityScorer
-
-                ppl = PerplexityScorer(calm_dir)
-                t0 = time.perf_counter()
-                results = ppl.batch_score([sequences[i] for i in need_ppl])
-                for idx, score in zip(need_ppl, results):
-                    ppl_scores[idx] = score
-                dt = time.perf_counter() - t0
-                timings["tier2_perplexity"] = dt
-                print(f"  {dt:.2f}s  ({len(need_ppl) / dt:.1f} seq/s)", flush=True)
-                del ppl
-
-        for i, v in enumerate(prebaked_ppl):
-            if v is not None:
-                ppl_scores[i] = v
 
     # --- Tier 3: Pfam ---
     pfam_n_domains: list[int | None] = [None] * n
@@ -323,7 +310,6 @@ def _run(items: list[dict], args: argparse.Namespace,
             "codon_entropy": f["codon_entropy"],
             "codon_gini": f["codon_gini"],
             "calm_score": calm_scores[i],
-            "perplexity": ppl_scores[i],
             "num_pfam_domains": pfam_n_domains[i],
             "best_pfam_evalue": pfam_best_evalue[i],
         })
@@ -331,7 +317,7 @@ def _run(items: list[dict], args: argparse.Namespace,
 
     for dataset, path in output_map.items():
         ds_df = df[df["dataset"] == dataset]
-        if path.exists():
+        if path.exists() and not getattr(args, "pfam_update", False):
             existing = pd.read_parquet(path)
             ds_df = pd.concat([existing, ds_df], ignore_index=True)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,6 +354,8 @@ def main() -> None:
     grp.add_argument("--coding", help="Coding FASTA (use with --noncoding)")
     grp.add_argument("--jsonl", help="Pre-baked JSONL path")
     grp.add_argument("--fasta-dir", help="Directory with *_pc*/*_nc* FASTA pairs")
+    grp.add_argument("--benchmark-root",
+                     help="Root dir with tool subdirs (e.g. data/benchmark)")
 
     ap.add_argument("--noncoding", help="Noncoding FASTA path")
     ap.add_argument("--dataset", help="Dataset tag (auto-derived in --fasta-dir mode)")
@@ -376,24 +364,103 @@ def main() -> None:
     ap.add_argument("--filter", default="*", help="Glob filter for --fasta-dir")
 
     ap.add_argument("--skip-gpu", action="store_true", help="CPU features only")
-    ap.add_argument("--skip-perplexity", action="store_true", help="Skip perplexity")
     ap.add_argument("--pfam", action="store_true", help="Enable Pfam scanning")
     ap.add_argument("--pfam-db", default=None, help="Pfam-A.hmm path")
     ap.add_argument("--calm-dir", default="models/calm")
-    ap.add_argument("--head-path", default="models/heads/mlp_head_v1.pt")
+    ap.add_argument("--head-path", default="models/heads/gated_head_v1.pt")
     ap.add_argument("--workers", type=int, default=0, help="CPU workers (0=auto)")
     ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--pfam-update", action="store_true",
+                    help="Re-run with Pfam on existing parquets (reuses CaLM scores)")
+    ap.add_argument("--nnodes", type=int, default=1,
+                    help="Total processing nodes (for distributed)")
+    ap.add_argument("--node-rank", type=int, default=0,
+                    help="This node's rank, 0-indexed (for distributed)")
     args = ap.parse_args()
 
-    if args.fasta_dir:
+    if args.benchmark_root:
+        from proteinqc.cli.benchmark_multispecies import discover_datasets
+
+        root = Path(args.benchmark_root)
+        out_dir = Path(args.output_dir)
+
+        all_datasets = discover_datasets(root)
+        if not all_datasets:
+            print(f"No datasets found under {root}", file=sys.stderr)
+            sys.exit(1)
+
+        # Estimate FASTA size per dataset for bin-packing
+        def _ds_size(ds: dict) -> int:
+            total = 0
+            for key in ("coding", "noncoding"):
+                v = ds.get(key)
+                if v is None:
+                    continue
+                paths = v if isinstance(v, list) else [v]
+                total += sum(p.stat().st_size for p in paths if p.exists())
+            if "mixed" in ds:
+                p = Path(ds["mixed"])
+                total += p.stat().st_size if p.exists() else 0
+            return total
+
+        # Greedy bin-packing across nodes
+        my_datasets = all_datasets
+        if args.nnodes > 1:
+            indexed = sorted(enumerate(all_datasets),
+                             key=lambda x: _ds_size(x[1]), reverse=True)
+            bins: list[list[dict]] = [[] for _ in range(args.nnodes)]
+            bin_sizes = [0] * args.nnodes
+            for _, ds in indexed:
+                lightest = bin_sizes.index(min(bin_sizes))
+                bins[lightest].append(ds)
+                bin_sizes[lightest] += _ds_size(ds)
+
+            my_datasets = bins[args.node_rank]
+            my_mb = bin_sizes[args.node_rank] / 1024**2
+            print(f"Node {args.node_rank}/{args.nnodes}: "
+                  f"{len(my_datasets)}/{len(all_datasets)} datasets "
+                  f"({my_mb:.1f} MB)", flush=True)
+
+        # Load sequences from each dataset
+        items: list[dict] = []
+        output_map: dict[str, Path] = {}
+        for ds in my_datasets:
+            tag = f"{ds['tool']}/{ds['species']}"
+            safe = tag.replace("/", "_").replace(" ", "_").replace("(", "").replace(")", "")
+            output_map[tag] = out_dir / f"{safe}.parquet"
+
+            if "mixed" in ds:
+                for hdr, seq in _parse_fasta(Path(ds["mixed"])):
+                    label = 1 if ("NM_" in hdr or "mRNA" in hdr.lower()) else 0
+                    items.append({"sequence_id": hdr, "sequence": seq,
+                                  "label": label, "dataset": tag})
+            else:
+                coding = ds["coding"]
+                noncoding = ds["noncoding"]
+                c_paths = coding if isinstance(coding, list) else [coding]
+                nc_paths = noncoding if isinstance(noncoding, list) else [noncoding]
+                for p in c_paths:
+                    for hdr, seq in _parse_fasta(Path(p)):
+                        items.append({"sequence_id": hdr, "sequence": seq,
+                                      "label": 1, "dataset": tag})
+                for p in nc_paths:
+                    for hdr, seq in _parse_fasta(Path(p)):
+                        items.append({"sequence_id": hdr, "sequence": seq,
+                                      "label": 0, "dataset": tag})
+            print(f"  {tag}", flush=True)
+
+        print(f"Total: {len(items)} sequences across {len(output_map)} datasets",
+              flush=True)
+
+    elif args.fasta_dir:
         pairs = _discover_pairs(Path(args.fasta_dir), args.filter)
         if not pairs:
             print(f"No *_pc*/*_nc* pairs found in {args.fasta_dir}", file=sys.stderr)
             sys.exit(1)
         out_dir = Path(args.output_dir)
         dir_name = Path(args.fasta_dir).name
-        items: list[dict] = []
-        output_map: dict[str, Path] = {}
+        items = []
+        output_map = {}
         for name, pc, nc in pairs:
             ds = f"{dir_name}/{name}"
             items.extend(_load_fasta_pair(pc, nc, ds))

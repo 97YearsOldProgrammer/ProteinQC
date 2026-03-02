@@ -25,8 +25,6 @@ Your analysis of the evidence (2-4 sentences). Mention which signals are most in
 ## Evidence interpretation guide:
 - CaLM score: Coding probability from a codon-level BERT encoder (85M params, 131 codon vocab, \
 trained on multi-species CDS). Range [0,1]. >0.5 suggests coding, <0.3 suggests noncoding.
-- Perplexity: Pseudo-perplexity from masked codon prediction. Lower = more natural codon usage. \
-<5 typical for real CDS, >8 for non-coding.
 - Protein preview: First 50 amino acids from longest-ORF translation.
 - Protein length: Full translated protein length in amino acids.
 - Pfam domains: Known protein domain hits from Pfam-A HMM scan. Any hit = strong coding evidence.
@@ -44,7 +42,6 @@ Classify this RNA sequence:
 | Species | {species} |
 | Length | {n_bp} bp ({n_codons} codons) |
 | CaLM score | {calm_score} |
-| Perplexity | {perplexity} |
 | Protein (first 50aa) | {protein_preview} |
 | Protein length | {protein_length} |
 | Pfam domains | {pfam_domains} |"""
@@ -71,7 +68,6 @@ def build_evidence_prompt(evidence: BakedEvidence) -> list[dict]:
         [system, user] message list for Llama 3.1 Instruct.
     """
     calm_str = f"{evidence.calm_score:.4f}" if evidence.calm_score is not None else "N/A"
-    ppl_str = f"{evidence.perplexity:.2f}" if evidence.perplexity is not None else "N/A"
 
     if evidence.translation:
         preview = evidence.translation[:50]
@@ -88,7 +84,6 @@ def build_evidence_prompt(evidence: BakedEvidence) -> list[dict]:
         n_bp=evidence.n_bp,
         n_codons=evidence.n_codons,
         calm_score=calm_str,
-        perplexity=ppl_str,
         protein_preview=protein_str,
         protein_length=protein_len,
         pfam_domains=evidence.domain_summary,

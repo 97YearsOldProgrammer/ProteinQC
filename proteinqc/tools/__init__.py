@@ -19,7 +19,6 @@ __all__ = [
     "GeneticCode",
     "ORFCandidate",
     "ORFScanner",
-    "PerplexityScorer",
     "PfamScanner",
     "RiboformerScorer",
     "SpeciesDetector",
@@ -32,9 +31,6 @@ __all__ = [
 
 def __getattr__(name: str):
     """Lazy-load heavy tools that have external dependencies."""
-    if name == "PerplexityScorer":
-        from .perplexity_scorer import PerplexityScorer
-        return PerplexityScorer
     if name == "PfamScanner":
         from .pfam_scanner import PfamScanner
         return PfamScanner

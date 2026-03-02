@@ -50,7 +50,7 @@ CaLM encoder (frozen) → [CLS] embedding (768-dim)
 ### Phase 2: Multi-Signal Scoring System (current)
 - **Confusion matrix analysis**: classify all benchmark errors as TP/FP/TN/FN
 - **Feature engineering**: run all tool calls on benchmark sequences
-  - CaLM score, CaLM perplexity, ORF length, codon_tai, Pfam hits, GC content
+  - CaLM score, ORF length, codon_tai, Pfam hits, GC content
 - **ML combiner**: XGBoost/scikit-learn on tool call features
   - Goal: patch CaLM's weak spots (short seqs, certain species) with additional signals
   - SHAP analysis to identify which tools matter most per failure mode

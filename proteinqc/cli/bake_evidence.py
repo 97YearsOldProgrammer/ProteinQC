@@ -1,13 +1,13 @@
 """Bake all biological evidence offline for GRPO v2 training.
 
-Runs CaLM scorer, perplexity scorer, translate, and Pfam scanner in batch
-on all RNA Challenge sequences. Outputs one JSONL line per sequence.
+Runs CaLM scorer, translate, and Pfam scanner in batch on all RNA Challenge
+sequences. Outputs one JSONL line per sequence.
 
 Supports incremental resume: if output file exists, skips already-baked IDs.
 
 Usage:
     bake-evidence --data data/rnachallenge/rnachallenge.tsv
-    bake-evidence --skip-perplexity --skip-pfam   # CaLM-only, ~15 min
+    bake-evidence --skip-pfam   # CaLM-only, ~15 min
 """
 
 from __future__ import annotations
@@ -96,12 +96,10 @@ def main() -> None:
                         help="Output JSONL path")
     parser.add_argument("--calm-dir", default="models/calm",
                         help="CaLM model directory")
-    parser.add_argument("--head-path", default="models/heads/mlp_head_v1.pt",
+    parser.add_argument("--head-path", default="models/heads/gated_head_v1.pt",
                         help="MLP head weights path")
     parser.add_argument("--pfam-db", default=None,
                         help="Pfam-A.hmm path (optional)")
-    parser.add_argument("--skip-perplexity", action="store_true",
-                        help="Skip perplexity scoring (faster)")
     parser.add_argument("--skip-pfam", action="store_true",
                         help="Skip Pfam domain scanning")
     parser.add_argument("--batch-size", type=int, default=32,
@@ -132,7 +130,6 @@ def main() -> None:
 
     # Initialize tools
     calm_scorer = None
-    perplexity_scorer = None
     pfam_scanner = None
 
     # CaLM scorer (always needed)
@@ -148,12 +145,6 @@ def main() -> None:
     print("Loading CaLM scorer...", flush=True)
     from proteinqc.tools.calm_scorer import CaLMScorer
     calm_scorer = CaLMScorer(calm_dir, head_path)
-
-    # Perplexity scorer (optional)
-    if not args.skip_perplexity:
-        print("Loading perplexity scorer...", flush=True)
-        from proteinqc.tools.perplexity_scorer import PerplexityScorer
-        perplexity_scorer = PerplexityScorer(calm_dir)
 
     # Pfam scanner (optional)
     if not args.skip_pfam and args.pfam_db:
@@ -179,8 +170,7 @@ def main() -> None:
     n_truncated = sum(1 for s in remaining if len(s["sequence"]) > CALM_MAX_BP)
 
     print(f"\nBaking {total} sequences...", flush=True)
-    print(f"  CaLM: yes | Perplexity: {not args.skip_perplexity} | "
-          f"Pfam: {pfam_scanner is not None}", flush=True)
+    print(f"  CaLM: yes | Pfam: {pfam_scanner is not None}", flush=True)
     if n_truncated:
         print(f"  Truncating {n_truncated} sequences to {CALM_MAX_BP} bp for CaLM", flush=True)
 
@@ -195,11 +185,6 @@ def main() -> None:
 
             # CaLM scores (batch, on truncated sequences)
             calm_scores = calm_scorer.batch_score(calm_sequences)
-
-            # Perplexity scores (sequential — each creates N masked copies)
-            ppl_scores: list[float | None] = [None] * len(batch)
-            if perplexity_scorer is not None:
-                ppl_scores = perplexity_scorer.batch_score(sequences)
 
             # Translations
             translations = [translate(seq) for seq in sequences]
@@ -230,7 +215,6 @@ def main() -> None:
                     "label": item["label"],
                     "species": item["species"],
                     "calm_score": calm_scores[i],
-                    "perplexity": ppl_scores[i],
                     "translation": translations[i] if translations[i] else None,
                     "pfam_domains": pfam_results[i],
                 }

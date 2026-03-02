@@ -24,19 +24,6 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
-        "name": "score_perplexity",
-        "description": (
-            "Compute codon pattern naturalness (pseudo-perplexity). "
-            "Lower = more natural coding patterns."
-        ),
-        "parameters": {
-            "sequence": {
-                "type": "string",
-                "description": "DNA sequence (ATG...stop)",
-            }
-        },
-    },
-    {
         "name": "scan_domains",
         "description": (
             "Scan translated protein for known Pfam domains and AntiFam "
@@ -134,7 +121,6 @@ class ToolExecutor:
         self._antifam_db_path = Path(antifam_db_path) if antifam_db_path else None
 
         self._calm_scorer = None
-        self._perplexity_scorer = None
         self._riboformer_scorer = None
         self._pfam_scanner = None
 
@@ -167,8 +153,6 @@ class ToolExecutor:
         """Route tool_name to the appropriate executor method."""
         if tool_name == "score_coding_potential":
             return self._exec_calm(arguments["sequence"])
-        if tool_name == "score_perplexity":
-            return self._exec_perplexity(arguments["sequence"])
         if tool_name == "scan_domains":
             return self._exec_pfam(arguments["sequence"])
         if tool_name == "score_translation_efficiency":
@@ -189,15 +173,6 @@ class ToolExecutor:
             self._calm_scorer = CaLMScorer(self._calm_model_dir, self._calm_head_path)
         scores = self._calm_scorer.batch_score([sequence])
         return f"{scores[0]:.6f}"
-
-    def _exec_perplexity(self, sequence: str) -> str:
-        if self._perplexity_scorer is None:
-            from proteinqc.tools.perplexity_scorer import PerplexityScorer
-            if self._calm_model_dir is None:
-                return "error: CaLM model path not configured"
-            self._perplexity_scorer = PerplexityScorer(self._calm_model_dir)
-        scores = self._perplexity_scorer.batch_score([sequence])
-        return f"{scores[0]:.4f}"
 
     def _exec_riboformer(self, sequence: str) -> str:
         if self._riboformer_scorer is None:

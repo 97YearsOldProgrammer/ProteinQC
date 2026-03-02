@@ -14,17 +14,14 @@ You have access to biological analysis tools. Use them to gather evidence, then 
 ## Tool interpretation guide:
 - score_coding_potential: CaLM neural network score. >0.5 suggests coding.
   Very short ORFs (<100 codons) may score low even if coding.
-- score_perplexity: Codon usage naturalness. Lower = more natural coding patterns.
-  Coding genes typically show perplexity <5. Non-coding ORFs >8.
 - scan_domains: Pfam protein domain hits. Known domains = strong coding evidence.
   AntiFam hits = spurious ORF signal. No hits is inconclusive.
 - translate_orf: Translate to amino acid sequence. Use before domain scanning.
 
 ## Strategy:
 1. Start with score_coding_potential -- it's fast and informative
-2. If ambiguous (0.3-0.7), use score_perplexity for a second opinion
-3. For borderline cases, translate and scan domains
-4. When confident, call classify with your decision
+2. For borderline cases (0.3-0.7), translate and scan domains
+3. When confident, call classify with your decision
 
 Call ONE tool at a time. After each result, decide your next action.
 Respond ONLY with a single <tool_call> block. No other text."""
@@ -33,7 +30,7 @@ USER_TEMPLATE = """\
 Classify this ORF (length={n_codons} codons, {n_bp} bp):
 Sequence (first 60bp): {seq_preview}...
 
-Available tools: score_coding_potential, score_perplexity, scan_domains, translate_orf, classify
+Available tools: score_coding_potential, scan_domains, translate_orf, classify
 
 To call a tool, respond with:
 <tool_call>

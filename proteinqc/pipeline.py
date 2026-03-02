@@ -15,13 +15,12 @@ from .tools.orf_scanner import ORFCandidate, ORFScanner
 from .tools.species_detect import SpeciesDetector, SpeciesMatch
 
 if TYPE_CHECKING:
-    from .tools.perplexity_scorer import PerplexityScorer
     from .tools.pfam_scanner import DomainHit, PfamScanner
     from .tools.riboformer_scorer import RiboformerScorer
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_MODEL_DIR = _PROJECT_ROOT / "models" / "calm"
-_DEFAULT_HEAD_PATH = _PROJECT_ROOT / "models" / "heads" / "mlp_head_v1.pt"
+_DEFAULT_HEAD_PATH = _PROJECT_ROOT / "models" / "heads" / "gated_head_v1.pt"
 _DEFAULT_PFAM_DIR = _PROJECT_ROOT / "models" / "pfam"
 
 
@@ -34,18 +33,17 @@ class ScoredORF:
 
 @dataclass(frozen=True)
 class EnrichedORF:
-    """ORF with classification, perplexity, and domain annotations."""
+    """ORF with classification and domain annotations."""
 
     candidate: ORFCandidate
     calm_score: float                        # coding probability [0, 1]
-    perplexity: Optional[float]              # lower = more natural; None if disabled
     translation_efficiency: Optional[float]  # Riboformer TE; None if disabled
     domain_hits: Optional[list[DomainHit]]   # None if disabled
     rank: int                                # 1-based, by calm_score desc
 
 
 class ORFPipeline:
-    """Scan transcript → score ORFs with CaLM → optionally enrich with perplexity/Pfam/Riboformer."""
+    """Scan transcript → score ORFs with CaLM → optionally enrich with Pfam/Riboformer."""
 
     def __init__(
         self,
@@ -53,7 +51,6 @@ class ORFPipeline:
         head_weights_path: Path | str = _DEFAULT_HEAD_PATH,
         min_codons: int = 30,
         genetic_code_id: int = 1,
-        enable_perplexity: bool = False,
         enable_pfam: bool = False,
         enable_riboformer: bool = False,
         pfam_db_path: Optional[Path | str] = None,
@@ -64,7 +61,6 @@ class ORFPipeline:
         self.head_weights_path = Path(head_weights_path)
         self.min_codons = min_codons
         self.genetic_code_id = genetic_code_id
-        self.enable_perplexity = enable_perplexity
         self.enable_pfam = enable_pfam
         self.enable_riboformer = enable_riboformer
         self.pfam_db_path = (
@@ -78,7 +74,6 @@ class ORFPipeline:
         self._table_manager: Optional[CodonTableManager] = None
         self._scorer: Optional[CaLMScorer] = None
         self._detector: Optional[SpeciesDetector] = None
-        self._perplexity_scorer: Optional[PerplexityScorer] = None
         self._pfam_scanner: Optional[PfamScanner] = None
         self._riboformer_scorer: Optional[RiboformerScorer] = None
 
@@ -90,9 +85,6 @@ class ORFPipeline:
             self._scorer = CaLMScorer(self.model_dir, self.head_weights_path)
         if self._detector is None:
             self._detector = SpeciesDetector()
-        if self.enable_perplexity and self._perplexity_scorer is None:
-            from .tools.perplexity_scorer import PerplexityScorer
-            self._perplexity_scorer = PerplexityScorer(self.model_dir)
         if self.enable_pfam and self._pfam_scanner is None:
             from .tools.pfam_scanner import PfamScanner
             antifam = self.antifam_db_path if self.antifam_db_path.exists() else None
@@ -150,16 +142,12 @@ class ORFPipeline:
         transcript: str,
         species_hint: Optional[str | int] = None,
     ) -> list[EnrichedORF]:
-        """Scan → score → enrich with perplexity/Pfam/Riboformer. Sorted by calm_score desc."""
+        """Scan → score → enrich with Pfam/Riboformer. Sorted by calm_score desc."""
         candidates, raw_scores = self._scan_and_score(transcript, species_hint)
         if not candidates:
             return []
 
         seqs = [c.seq for c in candidates]
-
-        perplexities: Optional[list[float]] = None
-        if self._perplexity_scorer is not None:
-            perplexities = self._perplexity_scorer.batch_score(seqs)
 
         te_scores: Optional[list[float]] = None
         if self._riboformer_scorer is not None:
@@ -186,7 +174,6 @@ class ORFPipeline:
                 EnrichedORF(
                     candidate=candidates[idx],
                     calm_score=raw_scores[idx],
-                    perplexity=perplexities[idx] if perplexities else None,
                     translation_efficiency=te_scores[idx] if te_scores else None,
                     domain_hits=domain_hits_list[idx] if domain_hits_list else None,
                     rank=rank,
