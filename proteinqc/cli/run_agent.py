@@ -80,19 +80,10 @@ def main():
         print(result)
         return
 
-    # Interactive REPL
-    print("ProteinQC Agent (type 'quit' or Ctrl+C to exit)")
-    print("-" * 50)
-    while True:
-        try:
-            query = input("\n> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
-            break
-        if not query or query.lower() in ("quit", "exit", "q"):
-            break
-        result = agent.run(query)
-        print(result)
+    # Interactive Rich REPL
+    from proteinqc.cli.tui import run_repl
+
+    run_repl(agent=agent, backend=args.backend, model_id=args.model)
 
 
 if __name__ == "__main__":

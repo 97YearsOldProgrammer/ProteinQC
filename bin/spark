@@ -7,6 +7,7 @@
 #   spark exec "python ..."       # run on spark-1089
 #   spark exec --worker "..."     # run on spark-0b7c
 #   spark exec --both "..."       # run on both (parallel)
+#   spark sync                    # rsync code to both Sparks + pip install -e .
 #   spark scp-results             # pull data/features/*.parquet back to Mac
 #   spark setup                   # install deps in both containers
 #
@@ -81,11 +82,35 @@ cmd_setup() {
         [[ "$host" == "$MASTER" ]] && name="spark-1089" || name="spark-0b7c"
         echo "=== $name ==="
         docker_run "$host" "
-            pip install -q safetensors huggingface-hub biopython python-codon-tables pandas pyarrow tqdm 2>&1 | tail -2
-            apt-get update -qq && apt-get install -y -qq hmmer 2>&1 | tail -1
+            pip install -q safetensors huggingface-hub biopython python-codon-tables pandas pyarrow tqdm h5py peft scikit-learn 2>&1 | tail -2
             pip install -q -e . 2>&1 | tail -1
             python3 -c 'import proteinqc; print(f\"proteinqc OK\")'
         "
+    done
+}
+
+cmd_sync() {
+    echo "Syncing code to both Sparks..."
+    local src="/Users/gongchen/Code/ProteinQC/"
+    local dst="/home/cg666/Code/ProteinQC/"
+    for host in "$MASTER" "$WORKER"; do
+        local name
+        [[ "$host" == "$MASTER" ]] && name="spark-1089" || name="spark-0b7c"
+        echo "  [$name] rsync proteinqc/ + pyproject.toml + bin/"
+        rsync -avz --delete \
+            -e "ssh -i \"$KEY\" -o StrictHostKeyChecking=no" \
+            --include='proteinqc/***' \
+            --include='pyproject.toml' \
+            --include='bin/***' \
+            --exclude='*' \
+            "$src" "$host:$dst"
+    done
+    echo "Done. Re-installing package..."
+    for host in "$MASTER" "$WORKER"; do
+        local name
+        [[ "$host" == "$MASTER" ]] && name="spark-1089" || name="spark-0b7c"
+        echo "  [$name] pip install -e ."
+        docker_run "$host" "pip install -q -e . 2>&1 | tail -1"
     done
 }
 
@@ -102,15 +127,17 @@ cmd_scp_results() {
 case "${1:-help}" in
     status)      cmd_status ;;
     exec)        shift; cmd_run "$@" ;;
+    sync)        cmd_sync ;;
     setup)       cmd_setup ;;
     scp-results) cmd_scp_results ;;
     *)
-        echo "Usage: spark {status|exec|setup|scp-results}"
+        echo "Usage: spark {status|exec|sync|setup|scp-results}"
         echo ""
         echo "  status         Check GPU/container status on both machines"
         echo "  exec CMD       Run command in master container"
         echo "  exec --worker  Run command in worker container"
         echo "  exec --both    Run command on both (parallel)"
+        echo "  sync           Rsync proteinqc/ + pyproject.toml + bin/ to both Sparks"
         echo "  setup          Install all deps in both containers"
         echo "  scp-results    Pull parquet files back to Mac"
         ;;

@@ -150,6 +150,93 @@ class RNABinaryDataset(Dataset):
         return cls(sequences, labels)
 
 
+# ── Batching infrastructure ──────────────────────────────────────
+
+PAD_BUCKETS = list(range(64, 1089, 64))  # 17 bucket sizes, CaLM max=1026
+
+
+def _bucket_pad(length: int) -> int:
+    """Round up length to nearest bucket boundary for torch.compile shape stability."""
+    for b in PAD_BUCKETS:
+        if length <= b:
+            return b
+    return PAD_BUCKETS[-1]
+
+
+def _length_sorted_chunks(source, sort_size: int = 256):
+    """Accumulate samples, sort by length, yield in length order."""
+    buf: list[dict] = []
+    for sample in source:
+        buf.append(sample)
+        if len(buf) >= sort_size:
+            buf.sort(key=lambda s: len(s["input_ids"]))
+            yield from buf
+            buf = []
+    if buf:
+        buf.sort(key=lambda s: len(s["input_ids"]))
+        yield from buf
+
+
+def token_budget_batcher(
+    source, budget: int, max_batch: int, collator, sort_size: int = 256,
+):
+    """Yield collated batches fitting within token budget.
+
+    Total tokens per batch = max_padded_length * batch_size <= budget.
+    Groups similar lengths together via length-sorted chunking.
+    """
+    batch: list[dict] = []
+    max_pad = 0
+
+    for sample in _length_sorted_chunks(source, sort_size):
+        padded = _bucket_pad(len(sample["input_ids"]))
+        new_max = max(max_pad, padded)
+
+        if batch and (new_max * (len(batch) + 1) > budget or len(batch) >= max_batch):
+            yield collator(batch)
+            batch = [sample]
+            max_pad = padded
+        else:
+            batch.append(sample)
+            max_pad = new_max
+
+    if batch:
+        yield collator(batch)
+
+
+def collate_binary(samples: list[dict]) -> dict[str, torch.Tensor]:
+    """Pad input_ids to bucket boundary, create attention_mask, stack labels."""
+    max_len = max(len(s["input_ids"]) for s in samples)
+    pad_len = _bucket_pad(max_len)
+
+    input_ids = torch.zeros(len(samples), pad_len, dtype=torch.long)
+    attention_mask = torch.zeros(len(samples), pad_len, dtype=torch.long)
+    labels = torch.tensor([s["label"] for s in samples], dtype=torch.long)
+
+    for i, s in enumerate(samples):
+        length = len(s["input_ids"])
+        input_ids[i, :length] = s["input_ids"]
+        attention_mask[i, :length] = 1
+
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+def pre_tokenize(sequences: list[str], labels: list[int], tokenizer) -> list[dict]:
+    """Encode all sequences once upfront.
+
+    Returns list of {input_ids: 1D tensor, label: int}.
+    Eliminates per-batch string tokenization from the training hot path.
+    """
+    samples = []
+    for seq, label in zip(sequences, labels):
+        ids = tokenizer.encode(seq)
+        samples.append({
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "label": label,
+        })
+    return samples
+
+
 def create_dummy_dataset(n_samples: int = 100) -> RNABinaryDataset:
     """Create dummy dataset for testing infrastructure.
 
