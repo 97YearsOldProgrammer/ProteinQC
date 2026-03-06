@@ -1,6 +1,9 @@
 """Pure PyTorch CaLM encoder — no transformers, no multimolecule.
 
-Pre-LN BERT architecture with RoPE positional embeddings.
+Pre-LN BERT architecture with pluggable position encoding:
+  - "rotary" (RoPE): original CaLM, max 1026 tokens
+  - "alibi": ALiBi bias, no position limit, extrapolates to any length
+
 Loads pre-trained CaLM weights from safetensors and provides
 [CLS] embedding extraction for downstream classification.
 """
@@ -66,11 +69,49 @@ def _apply_rope(
     return q_rot, k_rot
 
 
+# ── ALiBi (Attention with Linear Biases) ────────────────────────
+
+def _alibi_slopes(num_heads: int) -> torch.Tensor:
+    """Compute ALiBi slopes for each attention head.
+
+    For H heads, slopes are 2^(-8*i/H) for i in 1..H.
+    Returns shape [num_heads].
+    """
+    ratio = 2.0 ** (-8.0 / num_heads)
+    return torch.tensor(
+        [ratio ** i for i in range(1, num_heads + 1)],
+        dtype=torch.float32,
+    )
+
+
+def _build_alibi_bias(
+    num_heads: int,
+    seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build symmetric ALiBi bias matrix for bidirectional attention.
+
+    Returns [1, num_heads, seq_len, seq_len] added to attention logits.
+    Bias = -slope_h * |i - j|  (symmetric for BERT-style encoder).
+    """
+    positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+    # |i - j| distance matrix: [seq_len, seq_len]
+    rel_dist = (positions.unsqueeze(0) - positions.unsqueeze(1)).abs()
+    slopes = _alibi_slopes(num_heads).to(device)
+    # [num_heads, seq_len, seq_len]
+    bias = -slopes[:, None, None] * rel_dist[None, :, :]
+    return bias.unsqueeze(0)  # [1, H, S, S]
+
+
 class TransformerLayer(nn.Module):
     """Single Pre-LN transformer layer matching CaLM architecture.
 
+    Supports two position encoding modes:
+      - RoPE: rotates Q,K before attention (original CaLM)
+      - ALiBi: adds linear distance bias to attention logits (no Q,K modification)
+
     Pre-LN Attention:
-        LayerNorm → Q,K,V → RoPE → SDPA → OutProj → Residual
+        LayerNorm → Q,K,V → [RoPE or identity] → SDPA(+ALiBi bias) → OutProj → Residual
     Pre-LN FFN:
         LayerNorm → Linear(768→3072) → GELU → Linear(3072→768) → Residual
     """
@@ -112,8 +153,9 @@ class TransformerLayer(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
-        cos: torch.Tensor,
-        sin: torch.Tensor,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+        alibi_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # --- Pre-LN Attention ---
         h = self.attn_ln(x)
@@ -121,10 +163,20 @@ class TransformerLayer(nn.Module):
         k = self._reshape_for_heads(self.k_proj(h))
         v = self._reshape_for_heads(self.v_proj(h))
 
-        q, k = _apply_rope(q, k, cos, sin)
+        if cos is not None and sin is not None:
+            q, k = _apply_rope(q, k, cos, sin)
 
-        if _HAS_FLASH_ATTN and q.is_cuda:
-            # flash_attn expects [B, S, H, D] in float16/bfloat16
+        if alibi_bias is not None:
+            # Combine padding mask + ALiBi bias into a single additive mask
+            # attn_mask [B,1,1,S] bool → convert to float: 0 where valid, -inf where pad
+            pad_bias = torch.zeros_like(attn_mask, dtype=q.dtype)
+            pad_bias = pad_bias.masked_fill(~attn_mask, float("-inf"))
+            sdpa_mask = pad_bias + alibi_bias[:, :, :q.shape[2], :q.shape[2]]
+        else:
+            sdpa_mask = attn_mask
+
+        if _HAS_FLASH_ATTN and q.is_cuda and alibi_bias is None:
+            # FlashAttention path (RoPE only — FA doesn't accept custom bias)
             fa_dtype = torch.bfloat16
             q = q.transpose(1, 2).to(fa_dtype)
             k = k.transpose(1, 2).to(fa_dtype)
@@ -134,7 +186,7 @@ class TransformerLayer(nn.Module):
         else:
             attn_out = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attn_mask,
+                attn_mask=sdpa_mask,
                 dropout_p=self.attn_dropout_p if self.training else 0.0,
             )
             # [batch, heads, seq, head_dim] → [batch, seq, hidden]
@@ -174,17 +226,24 @@ _log = logging.getLogger(__name__)
 
 
 class CaLMEncoder(nn.Module):
-    """Pure PyTorch CaLM BERT encoder (12-layer Pre-LN, RoPE, 131 codon vocab)."""
+    """Pure PyTorch CaLM BERT encoder (12-layer Pre-LN, 131 codon vocab).
+
+    Supports two position encoding modes:
+      - "rotary": RoPE (original CaLM, hard limit at max_position_embeddings)
+      - "alibi": ALiBi bias, no position limit, extrapolates to any length
+    """
 
     def __init__(
         self,
         model_dir: Path | str,
         freeze: bool = True,
         load_lm_head: bool = False,
+        position_type: str = "rotary",
     ):
         super().__init__()
         self.model_dir = Path(model_dir)
         self.config = self._load_config()
+        self.position_type = position_type
 
         hidden_size = self.config["hidden_size"]
         num_heads = self.config["num_attention_heads"]
@@ -195,6 +254,7 @@ class CaLMEncoder(nn.Module):
         hidden_dropout = self.config["hidden_dropout"]
 
         self.hidden_size = hidden_size
+        self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
 
         # Embedding
@@ -229,10 +289,16 @@ class CaLMEncoder(nn.Module):
                 layer_norm_eps=layer_norm_eps,
             )
 
-        # RoPE cache (lazily built on first forward)
-        self._rope_cos: Optional[torch.Tensor] = None
-        self._rope_sin: Optional[torch.Tensor] = None
-        self._rope_seq_len: int = 0
+        # Position encoding caches (lazily built on first forward)
+        if position_type == "rotary":
+            self._rope_cos: Optional[torch.Tensor] = None
+            self._rope_sin: Optional[torch.Tensor] = None
+            self._rope_seq_len: int = 0
+        elif position_type == "alibi":
+            self._alibi_bias: Optional[torch.Tensor] = None
+            self._alibi_seq_len: int = 0
+        else:
+            raise ValueError(f"Unknown position_type: {position_type!r}. Use 'rotary' or 'alibi'.")
 
         # Load pre-trained weights
         self._load_weights()
@@ -324,6 +390,12 @@ class CaLMEncoder(nn.Module):
             )
             self._rope_seq_len = seq_len
 
+    def _ensure_alibi(self, seq_len: int, device: torch.device):
+        """Build or extend ALiBi bias cache if needed."""
+        if seq_len > self._alibi_seq_len or self._alibi_bias is None:
+            self._alibi_bias = _build_alibi_bias(self.num_heads, seq_len, device)
+            self._alibi_seq_len = seq_len
+
     def _encode(
         self,
         input_ids: torch.Tensor,
@@ -347,12 +419,17 @@ class CaLMEncoder(nn.Module):
 
             sdpa_mask = attention_mask[:, None, None, :].bool()  # [B,1,1,S] for SDPA
 
-            self._ensure_rope(seq_len, device)
-            cos = self._rope_cos.to(device=device, dtype=x.dtype)
-            sin = self._rope_sin.to(device=device, dtype=x.dtype)
+            cos = sin = alibi_bias = None
+            if self.position_type == "rotary":
+                self._ensure_rope(seq_len, device)
+                cos = self._rope_cos.to(device=device, dtype=x.dtype)
+                sin = self._rope_sin.to(device=device, dtype=x.dtype)
+            else:
+                self._ensure_alibi(seq_len, device)
+                alibi_bias = self._alibi_bias.to(device=device, dtype=x.dtype)
 
             for layer in self.layers:
-                x = layer(x, sdpa_mask, cos, sin)
+                x = layer(x, sdpa_mask, cos=cos, sin=sin, alibi_bias=alibi_bias)
 
             x = self.emb_layer_norm_after(x)
 

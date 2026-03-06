@@ -4,10 +4,15 @@ Wraps CaLMEncoder (frozen) + classification head (GatedHead or MLPHead)
 for scoring ORF candidates. Head type auto-detected from state dict keys.
 Uses TOKEN_BUDGET=8192 adaptive batching (same pattern as benchmark.py).
 Model loaded once on construction, reused across all calls.
+
+Supports two weight formats:
+- File (.pt): standalone head state dict (backward compat)
+- Directory (LoRA checkpoint): adapter_config.json + adapter_model.pt + head.pt
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -18,11 +23,13 @@ BATCH_MAX = 16        # absolute max batch size
 
 
 class CaLMScorer:
-    """Score DNA sequences for coding potential using frozen CaLM + MLP head.
+    """Score DNA sequences for coding potential using frozen CaLM + head.
 
     Args:
         model_dir: Path to CaLM model directory (config.json + model.safetensors)
-        head_weights_path: Path to saved MLPHead state dict (.pt file)
+        head_weights_path: Path to head weights — either a .pt file (standalone
+            head) or a directory containing a LoRA checkpoint (adapter_config.json,
+            adapter_model.pt, head.pt).
         device: Compute device. Auto-selects MPS/CUDA/CPU if None.
     """
 
@@ -31,6 +38,7 @@ class CaLMScorer:
         model_dir: Path | str,
         head_weights_path: Path | str,
         device: Optional[torch.device] = None,
+        position_type: str = "rotary",
     ):
         from proteinqc.data.tokenizer import CodonTokenizer
         from proteinqc.models.calm_encoder import CaLMEncoder
@@ -41,16 +49,34 @@ class CaLMScorer:
 
         self.tokenizer = CodonTokenizer(self.model_dir / "vocab.txt")
 
-        self.encoder = CaLMEncoder(self.model_dir, freeze=True).to(self.device)
-        self.encoder.train(False)  # inference mode
+        head_path = self.head_weights_path
+        is_lora = head_path.is_dir() and (head_path / "adapter_config.json").exists()
 
-        state = torch.load(
-            self.head_weights_path, map_location=self.device, weights_only=True
-        )
-        self.head = _build_head(state)
-        self.head.load_state_dict(state)
-        self.head = self.head.to(self.device)
-        self.head.train(False)  # inference mode
+        if is_lora:
+            # Auto-detect position_type from training log if available
+            training_log = head_path / "training_log.json"
+            if training_log.exists():
+                with open(training_log) as f:
+                    log_data = json.load(f)
+                position_type = log_data.get("position_type", position_type)
+
+            self.encoder, self.head = _load_lora_checkpoint(
+                self.model_dir, head_path, self.device,
+                position_type=position_type,
+            )
+        else:
+            self.encoder = CaLMEncoder(
+                self.model_dir, freeze=True, position_type=position_type,
+            ).to(self.device)
+            state = torch.load(
+                head_path, map_location=self.device, weights_only=True,
+            )
+            self.head = _build_head(state)
+            self.head.load_state_dict(state)
+            self.head = self.head.to(self.device)
+
+        self.encoder.train(False)
+        self.head.train(False)
 
     def batch_score(self, sequences: list[str]) -> list[float]:
         """Score DNA sequences for coding potential.
@@ -102,6 +128,57 @@ class CaLMScorer:
             i += adaptive_bs
 
         return scores
+
+
+def _load_lora_checkpoint(
+    model_dir: Path, ckpt_dir: Path, device: torch.device,
+    position_type: str = "rotary",
+) -> tuple[torch.nn.Module, torch.nn.Module]:
+    """Load CaLM encoder with merged LoRA weights + classification head.
+
+    Merges LoRA adapters directly into base weights: W' = W + (alpha/r) * B @ A.
+    No PEFT dependency needed at inference time.
+    """
+    from proteinqc.models.calm_encoder import CaLMEncoder
+
+    with open(ckpt_dir / "adapter_config.json") as f:
+        cfg = json.load(f)
+
+    encoder = CaLMEncoder(model_dir, freeze=True, position_type=position_type)
+
+    lora_state = torch.load(
+        ckpt_dir / "adapter_model.pt", map_location="cpu", weights_only=True,
+    )
+
+    scaling = cfg["lora_alpha"] / cfg["r"]
+    encoder_state = encoder.state_dict()
+
+    for key in list(lora_state.keys()):
+        if "lora_A" not in key:
+            continue
+        # e.g. layers.0.q_proj.lora_A.default.weight
+        base_key = key.replace(".lora_A.default.weight", ".weight")
+        b_key = key.replace("lora_A", "lora_B")
+
+        if base_key not in encoder_state:
+            continue
+
+        lora_a = lora_state[key]   # (r, in_features)
+        lora_b = lora_state[b_key]  # (out_features, r)
+        delta = (lora_b @ lora_a) * scaling
+        encoder_state[base_key] = encoder_state[base_key] + delta
+
+    encoder.load_state_dict(encoder_state)
+    encoder = encoder.to(device)
+
+    head_state = torch.load(
+        ckpt_dir / "head.pt", map_location=device, weights_only=True,
+    )
+    head = _build_head(head_state)
+    head.load_state_dict(head_state)
+    head = head.to(device)
+
+    return encoder, head
 
 
 def _build_head(state_dict: dict[str, torch.Tensor]) -> torch.nn.Module:

@@ -367,7 +367,7 @@ def main() -> None:
     ap.add_argument("--pfam", action="store_true", help="Enable Pfam scanning")
     ap.add_argument("--pfam-db", default=None, help="Pfam-A.hmm path")
     ap.add_argument("--calm-dir", default="models/calm")
-    ap.add_argument("--head-path", default="models/heads/gated_head_v1.pt")
+    ap.add_argument("--head-path", default="models/heads/lora_gated_v1")
     ap.add_argument("--workers", type=int, default=0, help="CPU workers (0=auto)")
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--pfam-update", action="store_true",

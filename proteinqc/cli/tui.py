@@ -6,7 +6,6 @@ FASTA loading, slash commands, and Rich-rendered output.
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,8 +64,28 @@ class SessionState:
 # Tool definitions: light vs heavy
 # ---------------------------------------------------------------------------
 
-LIGHT_TOOLS = ["translate_dna", "gc_content", "kozak_score", "scan_orfs"]
-HEAVY_TOOLS = {"calm_score": "86M params", "pfam_scan": "4.2GB HMM"}
+TOOL_INFO: dict[str, tuple[str, str, str, str]] = {
+    # name -> (status, weight, description, citation)
+    "translate_dna": ("ready", "", "Translate DNA to protein in all 6 reading frames", ""),
+    "gc_content": ("ready", "", "Compute GC% and nucleotide composition", ""),
+    "kozak_score": ("ready", "", "Score Kozak consensus strength around start codons", ""),
+    "scan_orfs": ("ready", "", "Find all open reading frames with start/stop positions", ""),
+    "calm_score": (
+        "lazy",
+        "86M params",
+        "Coding probability via codon-level BERT encoder",
+        "Outeiral, C. & Deane, C.M. Nat. Mach. Intell. 6, 170\u2013179 (2024)",
+    ),
+    "pfam_scan": (
+        "lazy",
+        "4.2GB HMM",
+        "Protein domain search against Pfam-A HMM library",
+        "Paysan-Lafosse, T. et al. Nucleic Acids Res. 53, D523\u2013D532 (2025)",
+    ),
+}
+
+LIGHT_TOOLS = [k for k, v in TOOL_INFO.items() if v[0] == "ready"]
+HEAVY_TOOLS = {k: v[1] for k, v in TOOL_INFO.items() if v[0] == "lazy"}
 
 
 def _detect_device() -> str:
@@ -121,12 +140,21 @@ def wrap_tool_with_spinner(tool: Any, state: SessionState) -> None:
 # ---------------------------------------------------------------------------
 
 
+_MASCOT = (
+    "  .~.  \n"
+    " (o.O) \n"
+    "  |P/  \n"
+    "   ~   \n"
+    "  d b  "
+)
+
+
 def render_banner(state: SessionState, agent: Any | None = None) -> Panel:
-    """Build the startup banner panel."""
+    """Build the startup banner panel with mascot on the right."""
     lines: list[str] = []
 
-    # Title line
-    lines.append(f"[bold white]ProteinQC v{__version__}[/]  |  CaLM 85.75M (frozen) + GatedHead")
+    # Title
+    lines.append(f"[bold white]ProteinQC v{__version__}[/]")
 
     # Backend / model
     model_short = state.model_id.split("/")[-1] if state.model_id else "none"
@@ -145,21 +173,33 @@ def render_banner(state: SessionState, agent: Any | None = None) -> Panel:
     lines.append(f"Tools: {ready}")
     lines.append(f"       {lazy}")
 
-    body = Text.from_markup("\n".join(lines))
-    return Panel(body, border_style="blue", padding=(0, 1))
+    info_text = Text.from_markup("\n".join(lines))
+    mascot_text = Text(_MASCOT, style="dim")
+
+    layout = Table(show_header=False, show_edge=False, box=None, padding=0)
+    layout.add_column(ratio=1)
+    layout.add_column(width=9, justify="right")
+    layout.add_row(info_text, mascot_text)
+
+    return Panel(layout, border_style="blue", padding=(0, 1))
 
 
 def render_tool_table() -> Table:
     """Render tool status as a Rich Table."""
-    table = Table(title="Tool Status", show_lines=False, padding=(0, 1))
+    table = Table(title="Tools", show_lines=False, padding=(0, 1))
     table.add_column("Tool", style="bold")
-    table.add_column("Status")
-    table.add_column("Info", style="dim")
+    table.add_column("Status", min_width=6)
+    table.add_column("Description")
 
-    for t in LIGHT_TOOLS:
-        table.add_row(t, "[green]ready[/]", "lightweight, no model load")
-    for t, info in HEAVY_TOOLS.items():
-        table.add_row(t, "[yellow]lazy[/]", f"loads on first call ({info})")
+    for name, (status, weight, desc, cite) in TOOL_INFO.items():
+        if status == "ready":
+            status_str = "[green]ready[/]"
+        else:
+            status_str = f"[yellow]lazy[/] [dim]({weight})[/dim]"
+        desc_text = desc
+        if cite:
+            desc_text += f"\n[italic]{cite}[/italic]"
+        table.add_row(name, status_str, desc_text)
     return table
 
 
@@ -273,9 +313,9 @@ COMMANDS: dict[str, str] = {
     "/tools": "Tool status table (loaded / lazy / unavailable)",
     "/load <path>": "Load FASTA file into session",
     "/seq <name>": "Preview loaded sequence (first 200 bp)",
-    "/seqs": "List all loaded sequence names",
+    "/seqs": "List all loaded sequences",
+    "/status": "Session stats (uptime, queries, tools, sequences)",
     "/clear": "Clear terminal screen",
-    "/status": "Session stats (uptime, queries, memory)",
     "/model": "Backend and model info",
     "/quit": "Exit",
 }
@@ -324,12 +364,17 @@ def _handle_slash(cmd: str, state: SessionState) -> bool:
         if not state.sequences:
             console.print("[dim]No sequences loaded. Use /load <path>[/dim]")
         else:
-            for name, seq in state.sequences.items():
-                console.print(f"  [cyan]{name}[/] — {len(seq):,} bp")
-        return True
-
-    if verb == "/clear":
-        console.clear()
+            table = Table(
+                title=f"Loaded Sequences ({len(state.sequences)})",
+                show_lines=False,
+                padding=(0, 1),
+            )
+            table.add_column("#", style="dim", justify="right", min_width=3)
+            table.add_column("Name", style="cyan")
+            table.add_column("Length", justify="right", style="bold")
+            for i, (name, seq) in enumerate(state.sequences.items(), 1):
+                table.add_row(str(i), name, f"{len(seq):,} bp")
+            console.print(table)
         return True
 
     if verb == "/status":
@@ -337,13 +382,10 @@ def _handle_slash(cmd: str, state: SessionState) -> bool:
         console.print(f"  Queries:     [cyan]{state.query_count}[/]")
         console.print(f"  Tool calls:  [cyan]{state.tool_calls}[/]")
         console.print(f"  Sequences:   [cyan]{len(state.sequences)}[/]")
-        try:
-            import psutil
+        return True
 
-            mem = psutil.Process().memory_info().rss / (1024**2)
-            console.print(f"  RSS memory:  [cyan]{mem:.0f} MB[/]")
-        except Exception:
-            pass
+    if verb == "/clear":
+        console.clear()
         return True
 
     if verb == "/model":
@@ -360,16 +402,72 @@ def _handle_slash(cmd: str, state: SessionState) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Status bar (persistent bottom toolbar)
+# ---------------------------------------------------------------------------
+
+
+def _get_memory_stats() -> tuple[int, int, int]:
+    """Return (rss_mb, gpu_allocated_mb, gpu_total_mb)."""
+    rss = 0
+    try:
+        import psutil
+
+        rss = int(psutil.Process().memory_info().rss / (1024**2))
+    except Exception:
+        pass
+
+    gpu_alloc, gpu_total = 0, 0
+    try:
+        import torch
+
+        if torch.backends.mps.is_available():
+            gpu_alloc = int(torch.mps.current_allocated_memory() / (1024**2))
+            gpu_total = int(torch.mps.driver_allocated_memory() / (1024**2))
+        elif torch.cuda.is_available():
+            gpu_alloc = int(torch.cuda.memory_allocated() / (1024**2))
+            gpu_total = int(torch.cuda.memory_reserved() / (1024**2))
+    except Exception:
+        pass
+
+    return rss, gpu_alloc, gpu_total
+
+
+def _build_status_bar(state: SessionState):
+    """Return a callable for prompt_toolkit's bottom_toolbar."""
+    try:
+        from prompt_toolkit.formatted_text import HTML
+    except ImportError:
+        return None
+
+    def _toolbar():
+        parts: list[str] = []
+        # Device
+        parts.append(state.device)
+        # Memory
+        rss, gpu_alloc, gpu_total = _get_memory_stats()
+        if rss:
+            parts.append(f"RAM {rss} MB")
+        if gpu_total:
+            parts.append(f"GPU {gpu_alloc}/{gpu_total} MB")
+        elif gpu_alloc:
+            parts.append(f"GPU {gpu_alloc} MB")
+        return HTML(" | ".join(parts))
+
+    return _toolbar
+
+
+# ---------------------------------------------------------------------------
 # Prompt input (prompt_toolkit with fallback)
 # ---------------------------------------------------------------------------
 
 
-def _build_prompt_session():
+def _build_prompt_session(state: SessionState):
     """Build a prompt_toolkit PromptSession, or None if unavailable."""
     try:
         from prompt_toolkit import PromptSession
         from prompt_toolkit.completion import WordCompleter
         from prompt_toolkit.history import FileHistory
+        from prompt_toolkit.styles import Style
 
         history_path = Path.home() / ".cache" / "proteinqc" / "repl_history"
         history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -378,9 +476,14 @@ def _build_prompt_session():
             list(COMMANDS.keys()) + ["/quit", "/exit"],
             sentence=True,
         )
+        toolbar_style = Style.from_dict({
+            "bottom-toolbar": "noreverse #888888",
+        })
         return PromptSession(
             history=FileHistory(str(history_path)),
             completer=completer,
+            bottom_toolbar=_build_status_bar(state),
+            style=toolbar_style,
         )
     except ImportError:
         return None
@@ -389,8 +492,13 @@ def _build_prompt_session():
 def _get_input(session) -> str:
     """Get user input via prompt_toolkit or builtin input()."""
     if session is not None:
-        return session.prompt("pqc> ")
-    return input("pqc> ")
+        try:
+            from prompt_toolkit.formatted_text import HTML
+
+            return session.prompt(HTML("<b>&gt;</b> "))
+        except ImportError:
+            return session.prompt("> ")
+    return input("> ")
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +544,7 @@ def run_repl(
     console.print(render_banner(state, agent))
     console.print("[dim]Type /help for commands, or enter a query.[/dim]\n")
 
-    prompt_session = _build_prompt_session()
+    prompt_session = _build_prompt_session(state)
 
     while True:
         try:

@@ -1,0 +1,243 @@
+#!/bin/bash
+#
+# Distributed LoRA fine-tuning across two DGX Sparks
+#
+# One-click (from master container):
+#   bin/lora-train --worker <WORKER_IP>
+#
+# Manual (run on each node separately):
+#   bin/lora-train --nnodes 2 --node-rank 0 --master <MASTER_IP>
+#   bin/lora-train --nnodes 2 --node-rank 1 --master <MASTER_IP>
+#
+# Single-node (default):
+#   bin/lora-train
+#
+# All extra flags passed to proteinqc.cli.train_lora_head
+
+set -e
+
+MASTER_ADDR="${MASTER_ADDR:-localhost}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+
+WORKER_IP=""
+WORKER_USER="cg666"
+CONTAINER="gt5"
+CODE_DIR="/workspace/Code/ProteinQC"
+SSH_KEY="/Users/gongchen/Library/Application Support/NVIDIA/Sync/config/nvsync.key"
+
+# Detect ConnectX-7 P2P interface (must be up AND have an IP)
+CX7_IF=""
+CX7_HCA=""
+for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do
+    if [ -d "/sys/class/net/$iface" ] && [ "$(cat /sys/class/net/$iface/operstate 2>/dev/null)" = "up" ]; then
+        HAS_IP=$(python3 -c "
+import socket,struct,fcntl; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+try: print(socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'$iface'))[20:24]))
+except: pass" 2>/dev/null)
+        if [ -n "$HAS_IP" ]; then
+            CX7_IF="$iface"
+            local_tmp="${iface#en}"
+            CX7_HCA="roce${local_tmp%np*}"
+            break
+        fi
+    fi
+done
+
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --worker)      WORKER_IP="$2"; NNODES=2; NODE_RANK=0; shift 2 ;;
+        --worker-user) WORKER_USER="$2"; shift 2 ;;
+        --container)   CONTAINER="$2"; shift 2 ;;
+        --master)      MASTER_ADDR="$2"; shift 2 ;;
+        --port)        MASTER_PORT="$2"; shift 2 ;;
+        --node-rank)   NODE_RANK="$2"; shift 2 ;;
+        --nnodes)      NNODES="$2"; shift 2 ;;
+        --*)
+            EXTRA_ARGS+=("$1")
+            if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
+                EXTRA_ARGS+=("$2")
+                shift
+            fi
+            shift
+            ;;
+        *) shift ;;
+    esac
+done
+
+
+#############################
+#####  NCCL Environment #####
+#############################
+
+NCCL_ENVS=(
+    "NCCL_DEBUG=INFO"
+    "NCCL_IB_HCA=${CX7_HCA:-roceP2p1s0f1}"
+    "NCCL_IB_TIMEOUT=23"
+    "NCCL_IB_RETRY_CNT=13"
+    "NCCL_IB_MERGE_NICS=0"
+    "NCCL_CROSS_NIC=0"
+    "NCCL_MAX_NCHANNELS=2"
+    "NCCL_NET_GDR_LEVEL=0"
+    "NCCL_NET_GDR_READ=0"
+    "NCCL_TIMEOUT=1800"
+    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800"
+)
+
+if [ -n "$CX7_IF" ]; then
+    NCCL_ENVS+=("NCCL_SOCKET_IFNAME=$CX7_IF" "GLOO_SOCKET_IFNAME=$CX7_IF")
+fi
+
+for env in "${NCCL_ENVS[@]}"; do
+    export "$env"
+done
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.8"
+export PYTHONUNBUFFERED=1
+
+
+####################
+#####  Header  #####
+####################
+
+echo "========================================"
+echo "  LoRA Distributed Fine-Tuning"
+echo "========================================"
+echo "Master:   $MASTER_ADDR:$MASTER_PORT"
+echo "Nodes:    $NNODES (this is node $NODE_RANK)"
+echo "CX7:      ${CX7_IF:-auto}"
+if [[ -n "$WORKER_IP" ]]; then
+    echo "Mode:     one-click (auto-launching worker)"
+    echo "Worker:   ${WORKER_USER}@${WORKER_IP}"
+fi
+echo "Args:     ${EXTRA_ARGS[*]}"
+echo "========================================"
+
+
+#############################
+#####  Torchrun Command #####
+#############################
+
+build_torchrun_cmd() {
+    local rank="$1"
+    echo "torchrun \
+        --nnodes=$NNODES \
+        --nproc_per_node=1 \
+        --node_rank=$rank \
+        --master_addr=$MASTER_ADDR \
+        --master_port=$MASTER_PORT \
+        -m proteinqc.cli.train_lora_head \
+        ${EXTRA_ARGS[*]}"
+}
+
+
+##############################
+#####  One-Click Launch  #####
+##############################
+
+if [[ -n "$WORKER_IP" ]]; then
+    # Auto-detect master IP
+    if [[ "$MASTER_ADDR" == "localhost" ]]; then
+        WORKER_SUBNET=$(echo "$WORKER_IP" | grep -oP '^\d+\.\d+\.\d+\.')
+        for ip in $(hostname -I 2>/dev/null); do
+            if [[ "$ip" == ${WORKER_SUBNET}* ]]; then
+                MASTER_ADDR="$ip"
+                break
+            fi
+        done
+        if [[ "$MASTER_ADDR" == "localhost" ]]; then
+            MASTER_ADDR=$(hostname -I 2>/dev/null | awk '{print $1}')
+        fi
+        echo "Detected master IP: $MASTER_ADDR"
+    fi
+
+    SSH_CMD="ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i '$SSH_KEY'"
+
+    # Build env string for worker
+    ENV_STR=""
+    for env in "${NCCL_ENVS[@]}"; do
+        case "$env" in
+            NCCL_SOCKET_IFNAME=*|GLOO_SOCKET_IFNAME=*|NCCL_IB_HCA=*) ;;
+            *) ENV_STR+="export $env; " ;;
+        esac
+    done
+    ENV_STR+="export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8; "
+    ENV_STR+="export PYTHONUNBUFFERED=1; "
+    # Worker detects its own CX7 interface
+    ENV_STR+="for iface in enP2p1s0f1np1 enP2p1s0f0np0 enp1s0f1np1 enp1s0f0np0; do "
+    ENV_STR+="  if [ -d /sys/class/net/\$iface ] && python3 -c \"import socket,struct,fcntl;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);socket.inet_ntoa(fcntl.ioctl(s.fileno(),0x8915,struct.pack('256s',b'\$iface'))[20:24])\" 2>/dev/null; then "
+    ENV_STR+="    export NCCL_SOCKET_IFNAME=\$iface; export GLOO_SOCKET_IFNAME=\$iface; "
+    ENV_STR+="    tmp=\${iface#en}; export NCCL_IB_HCA=roce\${tmp%np*}; break; "
+    ENV_STR+="  fi; "
+    ENV_STR+="done; "
+    ENV_STR+="cd $CODE_DIR; "
+
+    WORKER_CMD="${ENV_STR}$(build_torchrun_cmd 1)"
+
+    MASTER_PID=""
+    WORKER_PID=""
+
+    cleanup() {
+        echo ""
+        echo "[cleanup] Shutting down..."
+        [ -n "$MASTER_PID" ] && kill "$MASTER_PID" 2>/dev/null
+        [ -n "$WORKER_PID" ] && kill "$WORKER_PID" 2>/dev/null
+        # Kill remote torchrun
+        ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -i "$SSH_KEY" \
+            "${WORKER_USER}@${WORKER_IP}" \
+            "docker exec ${CONTAINER} bash -c 'pkill -9 -f torchrun; pkill -9 -f train_lora_head'" \
+            2>/dev/null || true
+        wait 2>/dev/null
+        echo "[cleanup] Done"
+    }
+    trap cleanup EXIT INT TERM
+
+    # Launch worker
+    echo ""
+    echo "[worker] Launching on ${WORKER_IP}..."
+    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i "$SSH_KEY" \
+        "${WORKER_USER}@${WORKER_IP}" \
+        "docker exec ${CONTAINER} bash -c '${WORKER_CMD}'" \
+        > >(while IFS= read -r line; do echo "[worker] $line"; done) \
+        2>&1 &
+    WORKER_PID=$!
+
+    sleep 3
+
+    # Launch master
+    echo "[master] Launching locally..."
+    cd "$CODE_DIR"
+    bash -c "$(build_torchrun_cmd 0)" &
+    MASTER_PID=$!
+
+    # Wait for master
+    wait "$MASTER_PID" 2>/dev/null
+    MASTER_EXIT=$?
+    echo ""
+    echo "[master] Exited (code=$MASTER_EXIT)"
+
+    # Kill worker
+    kill "$WORKER_PID" 2>/dev/null
+    wait "$WORKER_PID" 2>/dev/null || true
+
+    trap - EXIT INT TERM
+    echo "========================================"
+    echo "  LoRA Training Complete (exit=$MASTER_EXIT)"
+    echo "========================================"
+    exit $MASTER_EXIT
+
+
+########################
+#####  Manual Mode #####
+########################
+
+else
+    if [ -n "$CX7_IF" ]; then
+        echo "Using ConnectX-7: $CX7_IF"
+    fi
+
+    cd "$CODE_DIR"
+    bash -c "$(build_torchrun_cmd $NODE_RANK)"
+fi

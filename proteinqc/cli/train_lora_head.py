@@ -26,6 +26,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import torch.nn.functional as F
+
 from proteinqc.cli.benchmark_multispecies import (
     codon_align_longest_orf,
     discover_datasets,
@@ -33,6 +35,7 @@ from proteinqc.cli.benchmark_multispecies import (
     read_fasta_multi,
 )
 from proteinqc.data.dataset import (
+    MAX_SEQ_LEN,
     _bucket_pad,
     collate_binary,
     pre_tokenize,
@@ -55,6 +58,33 @@ from proteinqc.tools.codon_table import CodonTableManager
 from proteinqc.tools.orf_scanner import ORFScanner
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+# ── Focal loss ────────────────────────────────────────────────────
+
+class FocalBCEWithLogitsLoss(nn.Module):
+    """Binary focal loss (Lin et al. 2017). Drop-in replacement for BCEWithLogitsLoss.
+
+    Downweights easy samples so the model focuses on hard cases.
+    loss = -alpha * (1 - p_t)^gamma * log(p_t)
+    """
+
+    def __init__(self, gamma: float = 2.0, pos_weight: torch.Tensor | None = None):
+        super().__init__()
+        self.gamma = gamma
+        self.pos_weight = pos_weight
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # BCE component (with pos_weight for class balance)
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=self.pos_weight, reduction="none",
+        )
+        # p_t = probability of correct class
+        probs = torch.sigmoid(logits)
+        p_t = targets * probs + (1 - targets) * (1 - probs)
+        # Focal modulator: (1 - p_t)^gamma
+        focal_weight = (1 - p_t) ** self.gamma
+        return (focal_weight * bce).mean()
 
 
 # ── Combined module for DDP wrapping ──────────────────────────────
@@ -274,6 +304,8 @@ def train_lora(
     head_lr: float = 1e-3,
     grad_accum: int = 4,
     patience: int = 3,
+    log_interval: int = 100,
+    focal_gamma: float = 2.0,
 ) -> list[dict]:
     """Train LoRA adapters + head jointly. Supports DDP."""
     raw = unwrap(model)
@@ -283,17 +315,20 @@ def train_lora(
     lora_params = [p for n, p in raw.encoder.named_parameters() if p.requires_grad]
     head_params = list(raw.head.parameters())
 
+    all_trainable = lora_params + head_params  # cache for clip_grad_norm_
+
+    fused = device.type == "cuda"
     optimizer = torch.optim.AdamW([
         {"params": lora_params, "lr": lora_lr},
         {"params": head_params, "lr": head_lr},
-    ], weight_decay=1e-4)
+    ], weight_decay=1e-4, fused=fused)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     n_pos = sum(s["label"] for s in train_samples)
     n_neg = len(train_samples) - n_pos
     pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion = FocalBCEWithLogitsLoss(gamma=focal_gamma, pos_weight=pos_weight)
 
     log: list[dict] = []
     best_val_loss = float("inf")
@@ -320,6 +355,8 @@ def train_lora(
         epoch_loss = 0.0
         n_steps = 0
         n_tok = 0
+        opt_step_count = 0
+        epoch_t0 = time.monotonic()
         optimizer.zero_grad()
 
         for batch in token_budget_batcher(
@@ -341,20 +378,29 @@ def train_lora(
             n_tok += ids.numel()
 
             if n_steps % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    list(lora_params) + list(head_params), max_norm=1.0,
-                )
+                torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
+                opt_step_count += 1
+
+                if (log_interval > 0 and opt_step_count % log_interval == 0
+                        and is_main_process()):
+                    elapsed = time.monotonic() - epoch_t0
+                    avg = epoch_loss / n_steps
+                    bs = ids.shape[0]
+                    print(
+                        f"    [{epoch+1}/{epochs}] step {opt_step_count}  "
+                        f"loss={avg:.4f}  bs={bs}  "
+                        f"tok={n_tok:,}  {elapsed:.0f}s",
+                        flush=True,
+                    )
 
             if device.type == "mps":
                 torch.mps.empty_cache()
 
         # Final gradient step
         if n_steps % grad_accum != 0:
-            torch.nn.utils.clip_grad_norm_(
-                list(lora_params) + list(head_params), max_norm=1.0,
-            )
+            torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -445,6 +491,10 @@ def parse_args() -> argparse.Namespace:
         description="LoRA fine-tune CaLM + classification head (single/multi-node)",
     )
     p.add_argument("--benchmark-dir", type=Path, default=PROJECT_ROOT / "data" / "benchmark")
+    p.add_argument("--baked-train", type=Path, default=None,
+                   help="Pre-baked train.pt (skips FASTA loading + tokenization)")
+    p.add_argument("--baked-val", type=Path, default=None,
+                   help="Pre-baked val.pt (skips FASTA loading + tokenization)")
     p.add_argument("--model-dir", type=Path, default=PROJECT_ROOT / "models" / "calm")
     p.add_argument("--output", type=Path, default=PROJECT_ROOT / "models" / "heads" / "lora_mlp_v1")
     p.add_argument("--head", choices=["linear", "mlp", "gated"], default="mlp")
@@ -461,8 +511,14 @@ def parse_args() -> argparse.Namespace:
                    help="Max tokens per micro-batch (padded_len * batch_size)")
     p.add_argument("--max-batch", type=int, default=512,
                    help="Hard cap on batch size regardless of budget")
-    p.add_argument("--compile", action="store_true",
-                   help="torch.compile encoder+head (CUDA only)")
+    p.add_argument("--focal-gamma", type=float, default=2.0,
+                   help="Focal loss gamma (0=standard BCE, 2=default focal)")
+    p.add_argument("--position-type", choices=["rotary", "alibi"], default="alibi",
+                   help="Position encoding: 'rotary' (original RoPE, max 1026) or 'alibi' (no limit)")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile encoder+head (CUDA only, on by default)")
+    p.add_argument("--log-interval", type=int, default=100,
+                   help="Print training progress every N optimizer steps (0=epoch only)")
     p.add_argument(
         "--benchmark-results", type=Path, default=None,
         help="Path to benchmark_multispecies_longest_orf.json for difficulty-weighted sampling",
@@ -512,7 +568,7 @@ def main() -> None:
     # Load encoder (unfrozen for LoRA)
     if is_main_process():
         print(f"\nLoading CaLM encoder from {args.model_dir}...")
-    encoder = CaLMEncoder(args.model_dir, freeze=False)
+    encoder = CaLMEncoder(args.model_dir, freeze=False, position_type=args.position_type)
 
     # Apply LoRA (before moving to device / DDP)
     if is_main_process():
@@ -538,7 +594,10 @@ def main() -> None:
     if args.compile and device.type == "cuda":
         if is_main_process():
             print("\ntorch.compile (dynamic=None)...")
-        encoder._ensure_rope(1026, device)
+        if args.position_type == "rotary":
+            encoder._ensure_rope(1026, device)
+        else:
+            encoder._ensure_alibi(MAX_SEQ_LEN, device)
         model = torch.compile(model, dynamic=None)
 
     # Wrap with DDP
@@ -549,96 +608,109 @@ def main() -> None:
         from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
         model.register_comm_hook(state=None, hook=default_hooks.bf16_compress_hook)
 
-    # ── Load data (difficulty-weighted if benchmark results provided) ──
-    datasets = discover_datasets(args.benchmark_dir)
+    # ── Load data ──
+    test_samples = []
+    test_ds: list[str] = []
+    test_datasets: set[str] = set()
 
-    # Build per-dataset accuracy lookup from benchmark results
-    ds_acc: dict[str, float] = {}
-    bench_path = args.benchmark_results
-    if bench_path is None:
-        # Auto-detect
-        default_path = PROJECT_ROOT / "data" / "results" / "benchmark_multispecies_longest_orf.json"
-        if default_path.exists():
-            bench_path = default_path
-    if bench_path and bench_path.exists():
-        with open(bench_path) as f:
-            bench_data = json.load(f)
-        for entry in bench_data:
-            key = f"{entry['tool']}/{entry['species']}"
-            ds_acc[key] = entry["mlp_cls"]["ACC"]
+    if args.baked_train and args.baked_val:
+        # Fast path: load pre-baked .pt files (from bin/bake-eu7)
         if is_main_process():
-            n_hard = sum(1 for a in ds_acc.values() if a < args.hard_threshold)
-            print(f"\nDifficulty-weighted sampling: threshold={args.hard_threshold}%")
-            print(f"  Hard datasets (<{args.hard_threshold}%): {n_hard} (all seqs)")
-            print(f"  Easy datasets (>={args.hard_threshold}%): {len(ds_acc) - n_hard} (cap {args.easy_cap})")
+            print(f"\nLoading pre-baked data...")
+            print(f"  Train: {args.baked_train}")
+            print(f"  Val:   {args.baked_val}")
+        t_tok = time.time()
+        tr_samples = torch.load(args.baked_train, weights_only=False)
+        val_samples = torch.load(args.baked_val, weights_only=False)
+        if is_main_process():
+            n_pos = sum(1 for s in tr_samples if s["label"] == 1)
+            n_neg = len(tr_samples) - n_pos
+            print(f"  Train: {len(tr_samples):,} ({n_pos:,} cod / {n_neg:,} nc)")
+            print(f"  Val:   {len(val_samples):,}")
+            print(f"  Loaded in {time.time() - t_tok:.1f}s")
+    else:
+        # Legacy path: load from FASTA benchmark directories
+        datasets = discover_datasets(args.benchmark_dir)
 
-    # Set per-dataset sample caps based on difficulty
-    per_ds_cap: dict[str, int] = {}
-    for ds in datasets:
-        ds_name = f"{ds['tool']}/{ds['species']}"
-        if ds_name in ds_acc and ds_acc[ds_name] >= args.hard_threshold:
-            per_ds_cap[ds_name] = args.easy_cap
-        # else: no cap (all seqs)
+        ds_acc: dict[str, float] = {}
+        bench_path = args.benchmark_results
+        if bench_path is None:
+            default_path = PROJECT_ROOT / "data" / "results" / "benchmark_multispecies_longest_orf.json"
+            if default_path.exists():
+                bench_path = default_path
+        if bench_path and bench_path.exists():
+            with open(bench_path) as f:
+                bench_data = json.load(f)
+            for entry in bench_data:
+                key = f"{entry['tool']}/{entry['species']}"
+                ds_acc[key] = entry["mlp_cls"]["ACC"]
+            if is_main_process():
+                n_hard = sum(1 for a in ds_acc.values() if a < args.hard_threshold)
+                print(f"\nDifficulty-weighted sampling: threshold={args.hard_threshold}%")
+                print(f"  Hard datasets (<{args.hard_threshold}%): {n_hard} (all seqs)")
+                print(f"  Easy datasets (>={args.hard_threshold}%): {len(ds_acc) - n_hard} (cap {args.easy_cap})")
 
-    if is_main_process():
-        print(f"\nDiscovered {len(datasets)} dataset pairs")
-        print("Loading sequences...")
+        per_ds_cap: dict[str, int] = {}
+        for ds in datasets:
+            ds_name = f"{ds['tool']}/{ds['species']}"
+            if ds_name in ds_acc and ds_acc[ds_name] >= args.hard_threshold:
+                per_ds_cap[ds_name] = args.easy_cap
 
-    # Load with per-dataset caps
-    all_seqs, all_ids, all_labels, all_ds_names = load_all_sequences(
-        datasets, args.sample, align_fn, per_ds_cap=per_ds_cap,
-    )
-    if is_main_process():
-        print(f"Total: {len(all_seqs):,} sequences")
+        if is_main_process():
+            print(f"\nDiscovered {len(datasets)} dataset pairs")
+            print("Loading sequences...")
 
-    # Dataset-level split (deterministic, same on all ranks)
-    unique_ds = sorted(set(all_ds_names))
-    train_datasets, test_datasets = split_by_dataset(unique_ds, seed=args.seed)
-    if is_main_process():
-        print(f"\nDataset split: {len(train_datasets)} train / {len(test_datasets)} test")
+        all_seqs, all_ids, all_labels, all_ds_names = load_all_sequences(
+            datasets, args.sample, align_fn, per_ds_cap=per_ds_cap,
+        )
+        if is_main_process():
+            print(f"Total: {len(all_seqs):,} sequences")
 
-    train_seqs, train_labels = [], []
-    test_seqs, test_labels, test_ds = [], [], []
-    for seq, label, ds_name in zip(all_seqs, all_labels, all_ds_names):
-        if ds_name in train_datasets:
-            train_seqs.append(seq)
-            train_labels.append(label)
-        else:
-            test_seqs.append(seq)
-            test_labels.append(label)
-            test_ds.append(ds_name)
+        unique_ds = sorted(set(all_ds_names))
+        train_datasets, test_datasets = split_by_dataset(unique_ds, seed=args.seed)
+        if is_main_process():
+            print(f"\nDataset split: {len(train_datasets)} train / {len(test_datasets)} test")
 
-    # 10% of training for validation
-    rng = np.random.default_rng(args.seed)
-    n = len(train_seqs)
-    perm = rng.permutation(n)
-    n_val = int(n * 0.1)
+        train_seqs, train_labels = [], []
+        test_seqs, test_labels = [], []
+        for seq, label, ds_name in zip(all_seqs, all_labels, all_ds_names):
+            if ds_name in train_datasets:
+                train_seqs.append(seq)
+                train_labels.append(label)
+            else:
+                test_seqs.append(seq)
+                test_labels.append(label)
+                test_ds.append(ds_name)
 
-    val_seqs = [train_seqs[i] for i in perm[:n_val]]
-    val_labels = [train_labels[i] for i in perm[:n_val]]
-    tr_seqs = [train_seqs[i] for i in perm[n_val:]]
-    tr_labels = [train_labels[i] for i in perm[n_val:]]
+        rng = np.random.default_rng(args.seed)
+        n = len(train_seqs)
+        perm = rng.permutation(n)
+        n_val = int(n * 0.1)
 
-    n_pos = sum(tr_labels)
-    n_neg = len(tr_labels) - n_pos
-    if is_main_process():
-        print(f"\nTraining: {len(tr_seqs):,} seqs ({n_pos:,} coding, {n_neg:,} nc)")
-        print(f"Validation: {len(val_seqs):,} seqs")
-        print(f"Test: {len(test_seqs):,} seqs across {len(test_datasets)} datasets")
-        if is_dist:
-            ws = get_world_size()
-            print(f"  Per-rank: ~{len(tr_seqs) // ws:,} training seqs")
+        val_seqs = [train_seqs[i] for i in perm[:n_val]]
+        val_labels = [train_labels[i] for i in perm[:n_val]]
+        tr_seqs = [train_seqs[i] for i in perm[n_val:]]
+        tr_labels = [train_labels[i] for i in perm[n_val:]]
 
-    # ── Pre-tokenize all splits (one-time cost) ──
-    if is_main_process():
-        print("\nPre-tokenizing sequences...")
-    t_tok = time.time()
-    tr_samples = pre_tokenize(tr_seqs, tr_labels, tokenizer)
-    val_samples = pre_tokenize(val_seqs, val_labels, tokenizer)
-    test_samples = pre_tokenize(test_seqs, test_labels, tokenizer)
-    if is_main_process():
-        print(f"  Pre-tokenized {len(tr_samples) + len(val_samples) + len(test_samples):,} "
-              f"seqs in {time.time() - t_tok:.1f}s")
+        n_pos = sum(tr_labels)
+        n_neg = len(tr_labels) - n_pos
+        if is_main_process():
+            print(f"\nTraining: {len(tr_seqs):,} seqs ({n_pos:,} coding, {n_neg:,} nc)")
+            print(f"Validation: {len(val_seqs):,} seqs")
+            print(f"Test: {len(test_seqs):,} seqs across {len(test_datasets)} datasets")
+            if is_dist:
+                ws = get_world_size()
+                print(f"  Per-rank: ~{len(tr_seqs) // ws:,} training seqs")
+
+        if is_main_process():
+            print("\nPre-tokenizing sequences...")
+        t_tok = time.time()
+        tr_samples = pre_tokenize(tr_seqs, tr_labels, tokenizer)
+        val_samples = pre_tokenize(val_seqs, val_labels, tokenizer)
+        test_samples = pre_tokenize(test_seqs, test_labels, tokenizer)
+        if is_main_process():
+            print(f"  Pre-tokenized {len(tr_samples) + len(val_samples) + len(test_samples):,} "
+                  f"seqs in {time.time() - t_tok:.1f}s")
 
     barrier()
 
@@ -653,6 +725,8 @@ def main() -> None:
         head_lr=args.head_lr,
         grad_accum=args.grad_accum,
         patience=args.patience,
+        log_interval=args.log_interval,
+        focal_gamma=args.focal_gamma,
     )
     train_time = time.time() - t0
 
@@ -718,8 +792,8 @@ def main() -> None:
 
         with open(args.output / "training_log.json", "w") as f:
             json.dump({
-                "head": args.head, "lora_rank": args.lora_rank,
-                "lora_alpha": args.lora_alpha,
+                "head": args.head, "position_type": args.position_type,
+                "lora_rank": args.lora_rank, "lora_alpha": args.lora_alpha,
                 "epochs_run": len(log), "train_time_sec": train_time,
                 "n_lora_params": n_lora, "n_head_params": n_head,
                 "world_size": get_world_size(),

@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Download gold-standard EU7 training data from Ensembl/GENCODE.
+
+Downloads protein-coding and lncRNA transcript FASTAs for the 7 core
+Eukaryota species used in Singh & Roy 2022 benchmark. All URLs are
+versioned for reproducibility.
+
+Output: data/eu7/<species>/{coding.fa, noncoding.fa, manifest.json}
+
+Usage:
+    bin/download-eu7                    # download all 7 species
+    bin/download-eu7 --species human    # download one species
+    bin/download-eu7 --check            # verify checksums only
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import json
+import shutil
+import ssl
+import sys
+import urllib.request
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_DIR = PROJECT_ROOT / "data" / "eu7"
+
+# ── Versioned source URLs ─────────────────────────────────────────
+# GENCODE for human/mouse (gold standard, experimentally validated)
+# Ensembl for other species (curated genome annotations)
+# All transcript-level FASTA files, not genome assemblies.
+
+ENSEMBL_RELEASE = 113  # 2024-10, latest stable at time of writing
+
+EU7_SOURCES: dict[str, dict] = {
+    "human": {
+        "source": "GENCODE",
+        "version": "v46",
+        "coding_url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_46/gencode.v46.pc_transcripts.fa.gz",
+        "noncoding_url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_46/gencode.v46.lncRNA_transcripts.fa.gz",
+        "biotype_coding": "protein_coding",
+        "biotype_noncoding": "lncRNA",
+        "prefiltered": True,  # GENCODE files are already biotype-specific
+    },
+    "mouse": {
+        "source": "GENCODE",
+        "version": "vM35",
+        "coding_url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M35/gencode.vM35.pc_transcripts.fa.gz",
+        "noncoding_url": "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M35/gencode.vM35.lncRNA_transcripts.fa.gz",
+        "biotype_coding": "protein_coding",
+        "biotype_noncoding": "lncRNA",
+        "prefiltered": True,
+    },
+    "zebrafish": {
+        "source": "Ensembl",
+        "version": f"release-{ENSEMBL_RELEASE}",
+        "coding_url": f"https://ftp.ensembl.org/pub/release-{ENSEMBL_RELEASE}/fasta/danio_rerio/cdna/Danio_rerio.GRCz11.cdna.all.fa.gz",
+        "noncoding_url": f"https://ftp.ensembl.org/pub/release-{ENSEMBL_RELEASE}/fasta/danio_rerio/ncrna/Danio_rerio.GRCz11.ncrna.fa.gz",
+        "biotype_coding": "protein_coding",
+        "biotype_noncoding": "lncRNA",
+    },
+    "fruitfly": {
+        "source": "Ensembl",
+        "version": f"release-{ENSEMBL_RELEASE}",
+        "coding_url": f"https://ftp.ensembl.org/pub/release-{ENSEMBL_RELEASE}/fasta/drosophila_melanogaster/cdna/Drosophila_melanogaster.BDGP6.46.cdna.all.fa.gz",
+        "noncoding_url": f"https://ftp.ensembl.org/pub/release-{ENSEMBL_RELEASE}/fasta/drosophila_melanogaster/ncrna/Drosophila_melanogaster.BDGP6.46.ncrna.fa.gz",
+        "biotype_coding": "protein_coding",
+        "biotype_noncoding": "lncRNA",
+    },
+    "yeast": {
+        "source": "Ensembl Fungi",
+        "version": "release-60",
+        "coding_url": "https://ftp.ensemblgenomes.org/pub/fungi/release-60/fasta/saccharomyces_cerevisiae/cdna/Saccharomyces_cerevisiae.R64-1-1.cdna.all.fa.gz",
+        "noncoding_url": "https://ftp.ensemblgenomes.org/pub/fungi/release-60/fasta/saccharomyces_cerevisiae/ncrna/Saccharomyces_cerevisiae.R64-1-1.ncrna.fa.gz",
+        "biotype_coding": "protein_coding",
+        "biotype_noncoding": "lncRNA",
+        "noncoding_supplement": "rnacentral",
+        "note": "Yeast has ~1.5K ncRNA in Ensembl. Supplement with RNAcentral if needed.",
+    },
+    "c_elegans": {
+        "source": "Ensembl",
+        "version": f"release-{ENSEMBL_RELEASE}",
+        "coding_url": f"https://ftp.ensembl.org/pub/release-{ENSEMBL_RELEASE}/fasta/caenorhabditis_elegans/cdna/Caenorhabditis_elegans.WBcel235.cdna.all.fa.gz",
+        "noncoding_url": f"https://ftp.ensembl.org/pub/release-{ENSEMBL_RELEASE}/fasta/caenorhabditis_elegans/ncrna/Caenorhabditis_elegans.WBcel235.ncrna.fa.gz",
+        "biotype_coding": "protein_coding",
+        "biotype_noncoding": "lncRNA",
+    },
+    "arabidopsis": {
+        "source": "Ensembl Plants",
+        "version": "release-60",
+        "coding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/arabidopsis_thaliana/cdna/Arabidopsis_thaliana.TAIR10.cdna.all.fa.gz",
+        "noncoding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/arabidopsis_thaliana/ncrna/Arabidopsis_thaliana.TAIR10.ncrna.fa.gz",
+        "biotype_coding": "protein_coding",
+        "biotype_noncoding": "lncRNA",
+    },
+}
+
+
+# ── Download + filter ─────────────────────────────────────────────
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def download_gz(url: str, dest: Path) -> Path:
+    """Download .gz file, return path to decompressed file."""
+    gz_path = dest.with_suffix(dest.suffix + ".gz")
+    print(f"  Downloading {url}")
+    print(f"    -> {gz_path.name}")
+    try:
+        # ensemblgenomes.org has SSL cert issues; fall back to unverified
+        ctx = ssl.create_default_context()
+        if "ensemblgenomes.org" in url:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, context=ctx) as resp, open(gz_path, "wb") as out:
+            shutil.copyfileobj(resp, out)
+    except Exception as e:
+        print(f"    FAILED: {e}")
+        raise
+    # Decompress
+    with gzip.open(gz_path, "rb") as f_in, open(dest, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    gz_path.unlink()
+    return dest
+
+
+# Ensembl biotypes that are long noncoding (not structural/small RNA)
+LNCRNA_BIOTYPES = {
+    "lncRNA", "lincRNA", "antisense", "antisense_RNA",
+    "processed_transcript", "sense_intronic", "sense_overlapping",
+    "macro_lncRNA", "bidirectional_promoter_lncRNA", "ncRNA",
+}
+
+
+def filter_fasta_by_biotype(
+    input_path: Path, output_path: Path, biotype: str,
+) -> tuple[int, int]:
+    """Filter FASTA to keep only transcripts matching biotype(s).
+
+    Ensembl headers: >ENST... gene_biotype:lincRNA transcript_biotype:lincRNA
+    For noncoding: if biotype is "lncRNA", accepts all LNCRNA_BIOTYPES.
+    For coding: exact match on "protein_coding".
+
+    Returns (kept, total) counts.
+    """
+    accept = LNCRNA_BIOTYPES if biotype == "lncRNA" else {biotype}
+    total = 0
+    kept = 0
+    writing = False
+
+    with open(input_path) as fin, open(output_path, "w") as fout:
+        for line in fin:
+            if line.startswith(">"):
+                total += 1
+                header = line.rstrip()
+                # Extract gene_biotype value from Ensembl header
+                match = False
+                for tag in ("gene_biotype:", "transcript_biotype:"):
+                    idx = header.find(tag)
+                    if idx >= 0:
+                        val = header[idx + len(tag):].split()[0]
+                        if val in accept:
+                            match = True
+                            break
+                if match:
+                    kept += 1
+                    writing = True
+                    fout.write(line)
+                else:
+                    writing = False
+            elif writing:
+                fout.write(line)
+
+    return kept, total
+
+
+def count_fasta(path: Path) -> int:
+    """Count sequences in a FASTA file."""
+    n = 0
+    with open(path) as f:
+        for line in f:
+            if line.startswith(">"):
+                n += 1
+    return n
+
+
+def process_species(species: str, info: dict, out_dir: Path) -> dict:
+    """Download and filter one species. Returns manifest entry."""
+    sp_dir = out_dir / species
+    sp_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_coding = sp_dir / "raw_coding.fa"
+    raw_noncoding = sp_dir / "raw_noncoding.fa"
+    coding_out = sp_dir / "coding.fa"
+    noncoding_out = sp_dir / "noncoding.fa"
+    is_gencode = info.get("prefiltered", False)
+
+    manifest: dict = {
+        "species": species,
+        "source": info["source"],
+        "version": info["version"],
+    }
+
+    # Download coding
+    print(f"\n[{species}] coding transcripts ({info['source']} {info['version']})")
+    if is_gencode:
+        # GENCODE pc_transcripts files are already protein-coding only
+        download_gz(info["coding_url"], coding_out)
+        c_kept = c_total = count_fasta(coding_out)
+        print(f"    GENCODE pre-filtered: {c_kept:,} transcripts (all protein_coding)")
+    else:
+        download_gz(info["coding_url"], raw_coding)
+        c_kept, c_total = filter_fasta_by_biotype(
+            raw_coding, coding_out, info["biotype_coding"],
+        )
+        print(f"    Filtered: {c_kept:,}/{c_total:,} transcripts (biotype={info['biotype_coding']})")
+        raw_coding.unlink()
+
+    manifest["coding_url"] = info["coding_url"]
+    manifest["coding_total"] = c_total
+    manifest["coding_kept"] = c_kept
+    manifest["coding_sha256"] = sha256_file(coding_out)
+
+    # Download noncoding
+    print(f"[{species}] noncoding transcripts ({info['source']} {info['version']})")
+    if is_gencode:
+        # GENCODE lncRNA_transcripts files are already lncRNA only
+        download_gz(info["noncoding_url"], noncoding_out)
+        nc_kept = nc_total = count_fasta(noncoding_out)
+        print(f"    GENCODE pre-filtered: {nc_kept:,} transcripts (all lncRNA)")
+    else:
+        download_gz(info["noncoding_url"], raw_noncoding)
+        nc_kept, nc_total = filter_fasta_by_biotype(
+            raw_noncoding, noncoding_out, info["biotype_noncoding"],
+        )
+        if raw_noncoding.exists():
+            raw_noncoding.unlink()
+        if nc_kept < 100:
+            print(f"    WARNING: Only {nc_kept} lncRNA-like transcripts from {nc_total} total ncRNA.")
+
+    print(f"    Result: {nc_kept:,} noncoding transcripts")
+    manifest["noncoding_url"] = info["noncoding_url"]
+    manifest["noncoding_total"] = nc_total
+    manifest["noncoding_kept"] = nc_kept
+    manifest["noncoding_sha256"] = sha256_file(noncoding_out)
+
+    if "note" in info:
+        manifest["note"] = info["note"]
+
+    # Length stats
+    lengths = {"coding": [], "noncoding": []}
+    for label, path in [("coding", coding_out), ("noncoding", noncoding_out)]:
+        seq_len = 0
+        with open(path) as f:
+            for line in f:
+                if line.startswith(">"):
+                    if seq_len > 0:
+                        lengths[label].append(seq_len)
+                    seq_len = 0
+                else:
+                    seq_len += len(line.strip())
+            if seq_len > 0:
+                lengths[label].append(seq_len)
+
+    for label in ["coding", "noncoding"]:
+        lens = lengths[label]
+        if lens:
+            import statistics
+            short = sum(1 for l in lens if l < 300)
+            medium = sum(1 for l in lens if 300 <= l < 1000)
+            long = sum(1 for l in lens if l >= 1000)
+            manifest[f"{label}_length_bins"] = {
+                "short_lt300": short,
+                "medium_300_1000": medium,
+                "long_gte1000": long,
+            }
+            manifest[f"{label}_median_len"] = int(statistics.median(lens))
+            print(f"    {label} lengths: {short} short / {medium} medium / {long} long "
+                  f"(median {manifest[f'{label}_median_len']}nt)")
+
+    # Save per-species manifest
+    with open(sp_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    return manifest
+
+
+def verify_checksums(out_dir: Path) -> bool:
+    """Verify all downloaded files against manifest checksums."""
+    all_ok = True
+    for sp_dir in sorted(out_dir.iterdir()):
+        manifest_path = sp_dir / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        species = manifest["species"]
+        for label in ["coding", "noncoding"]:
+            path = sp_dir / f"{label}.fa"
+            expected = manifest.get(f"{label}_sha256")
+            if not path.exists():
+                print(f"  MISSING: {species}/{label}.fa")
+                all_ok = False
+                continue
+            actual = sha256_file(path)
+            if actual != expected:
+                print(f"  MISMATCH: {species}/{label}.fa")
+                print(f"    expected: {expected}")
+                print(f"    actual:   {actual}")
+                all_ok = False
+            else:
+                n = manifest.get(f"{label}_kept", "?")
+                print(f"  OK: {species}/{label}.fa ({n} seqs)")
+
+    return all_ok
+
+
+# ── CLI ───────────────────────────────────────────────────────────
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Download EU7 gold-standard training data")
+    p.add_argument("--species", choices=list(EU7_SOURCES) + ["all"], default="all",
+                   help="Which species to download (default: all)")
+    p.add_argument("--output", type=Path, default=OUTPUT_DIR,
+                   help=f"Output directory (default: {OUTPUT_DIR})")
+    p.add_argument("--check", action="store_true",
+                   help="Verify checksums only, don't download")
+    args = p.parse_args()
+
+    if args.check:
+        print("Verifying checksums...")
+        ok = verify_checksums(args.output)
+        sys.exit(0 if ok else 1)
+
+    species_list = list(EU7_SOURCES) if args.species == "all" else [args.species]
+    args.output.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("  EU7 Gold-Standard Dataset Download")
+    print("=" * 60)
+    print(f"Source: GENCODE (human/mouse) + Ensembl {ENSEMBL_RELEASE} (others)")
+    print(f"Output: {args.output}")
+    print(f"Species: {', '.join(species_list)}")
+
+    all_manifests = []
+    for species in species_list:
+        info = EU7_SOURCES[species]
+        try:
+            manifest = process_species(species, info, args.output)
+            all_manifests.append(manifest)
+        except Exception as e:
+            print(f"\n  ERROR processing {species}: {e}")
+            continue
+
+    # Write combined manifest
+    combined_path = args.output / "manifest.json"
+    with open(combined_path, "w") as f:
+        json.dump({
+            "description": "EU7 gold-standard training data for ProteinQC",
+            "reference": "Singh & Roy 2022 (doi:10.1093/nar/gkac1092)",
+            "ensembl_release": ENSEMBL_RELEASE,
+            "species": all_manifests,
+        }, f, indent=2)
+
+    # Summary table
+    print("\n" + "=" * 60)
+    print("  Summary")
+    print("=" * 60)
+    print(f"{'Species':<14} {'Coding':>8} {'Noncoding':>10} {'Source':<16}")
+    print("-" * 52)
+    total_c, total_nc = 0, 0
+    for m in all_manifests:
+        c = m["coding_kept"]
+        nc = m["noncoding_kept"]
+        total_c += c
+        total_nc += nc
+        print(f"{m['species']:<14} {c:>8,} {nc:>10,} {m['source']} {m['version']}")
+    print("-" * 52)
+    print(f"{'TOTAL':<14} {total_c:>8,} {total_nc:>10,}")
+    print(f"\nManifest: {combined_path}")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
