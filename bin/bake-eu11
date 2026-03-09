@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Bake EU11 training data + Chicken/Sorghum validation into pre-tokenized .pt files.
+
+EU11 = EU7 (human, mouse, zebrafish, fruitfly, c_elegans, yeast, arabidopsis)
+     + 4 plants (rice, maize, tomato, soybean)
+
+Validation: chicken (animal holdout) + sorghum (plant holdout, from benchmark).
+
+Output: data/baked/eu11/{train.pt, val.pt, manifest.json}
+
+Usage:
+    bin/bake-eu11                         # default: all data
+    bin/bake-eu11 --per-species 10000     # cap per species
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# ── Species config ────────────────────────────────────────────────
+
+EU11_SPECIES = {
+    # Original EU7
+    "human": "human",
+    "mouse": "mouse",
+    "zebrafish": "zebrafish",
+    "fruitfly": "fruitfly",
+    "c_elegans": "c_elegans",
+    "yeast": "yeast",
+    "arabidopsis": "arabidopsis",
+    # New plants
+    "rice": "rice",
+    "maize": "maize",
+    "tomato": "tomato",
+    "soybean": "soybean",
+}
+
+# Validation: phylogenetic holdouts (1 animal + 1 plant)
+VAL_SOURCES = {
+    "chicken": {
+        "tool": "LncFinder",
+        "coding": ["data/benchmark/lncfinder/Chicken/Chicken/pct.chicken.fa"],
+        "noncoding": ["data/benchmark/lncfinder/Chicken/Chicken/lnc.chicken.fa"],
+    },
+    "sorghum": {
+        "tool": "RNAplonc",
+        "coding": ["data/benchmark/rnaplonc/coding/sbicolor.fasta"],
+        "noncoding": ["data/benchmark/rnaplonc/noncoding/sorghum.fasta"],
+    },
+}
+
+
+# ── FASTA reading ─────────────────────────────────────────────────
+
+def read_fasta(path: Path, max_seqs: int = 0) -> list[tuple[str, str]]:
+    """Read FASTA file, return list of (header, sequence)."""
+    records: list[tuple[str, str]] = []
+    header = ""
+    seq_parts: list[str] = []
+
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if header and seq_parts:
+                    records.append((header, "".join(seq_parts)))
+                    if max_seqs and len(records) >= max_seqs:
+                        return records
+                header = line[1:]
+                seq_parts = []
+            elif line:
+                seq_parts.append(line)
+
+    if header and seq_parts:
+        records.append((header, "".join(seq_parts)))
+
+    return records
+
+
+# ── ORF alignment ─────────────────────────────────────────────────
+
+def codon_align_longest_orf(seq: str) -> str:
+    """Find longest ORF and return codon-aligned sequence."""
+    from proteinqc.tools.codon_table import CodonTableManager
+    from proteinqc.tools.orf_scanner import ORFScanner
+
+    if not hasattr(codon_align_longest_orf, "_scanner"):
+        ctm = CodonTableManager()
+        codon_align_longest_orf._scanner = ORFScanner(
+            ctm.get_genetic_code(1), min_codons=30,
+        )
+
+    scanner = codon_align_longest_orf._scanner
+    seq_upper = seq.upper().replace("U", "T")
+    orfs = scanner.scan(seq_upper)
+
+    if not orfs:
+        trim = len(seq_upper) - (len(seq_upper) % 3)
+        return seq_upper[:trim] if trim >= 9 else ""
+
+    best = max(orfs, key=lambda o: o.length_codons)
+    start = best.start
+    aligned_start = start % 3
+    aligned = seq_upper[aligned_start:]
+    trim = len(aligned) - (len(aligned) % 3)
+    return aligned[:trim]
+
+
+# ── Baking ────────────────────────────────────────────────────────
+
+def bake_split(
+    species_data: dict[str, list[tuple[str, str, int]]],
+    tokenizer,
+    per_species: int,
+    max_tokens: int = 0,
+    seed: int = 42,
+) -> tuple[list[dict], dict]:
+    """Tokenize all data. Returns (samples, stats)."""
+    rng = np.random.default_rng(seed)
+    all_samples = []
+    stats: dict[str, dict] = {}
+    n_truncated = 0
+
+    for species, records in sorted(species_data.items()):
+        if not records:
+            print(f"  {species}: SKIP (no data)")
+            continue
+
+        if per_species > 0 and len(records) > per_species:
+            idx = rng.choice(len(records), size=per_species, replace=False)
+            records = [records[i] for i in idx]
+
+        n_coding = sum(1 for _, _, l in records if l == 1)
+        n_noncoding = len(records) - n_coding
+
+        species_samples = []
+        for header, seq, label in records:
+            ids = tokenizer.encode(seq)
+            if len(ids) < 4:
+                continue
+            ids_t = torch.tensor(ids, dtype=torch.long)
+            if max_tokens > 0 and len(ids_t) > max_tokens:
+                ids_t = ids_t[:max_tokens]
+                n_truncated += 1
+            species_samples.append({
+                "input_ids": ids_t,
+                "label": label,
+            })
+
+        all_samples.extend(species_samples)
+        stats[species] = {
+            "total": len(species_samples),
+            "coding": n_coding,
+            "noncoding": n_noncoding,
+        }
+        print(f"  {species}: {len(species_samples)} samples "
+              f"({n_coding} cod / {n_noncoding} nc)")
+
+    if n_truncated:
+        print(f"  Truncated {n_truncated} sequences to {max_tokens} tokens")
+
+    return all_samples, stats
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Bake EU11 + validation data into .pt files")
+    p.add_argument("--eu-dir", type=Path, default=PROJECT_ROOT / "data" / "eu7")
+    p.add_argument("--benchmark-dir", type=Path, default=PROJECT_ROOT / "data" / "benchmark")
+    p.add_argument("--output", type=Path, default=PROJECT_ROOT / "data" / "baked" / "eu11")
+    p.add_argument("--vocab", type=Path, default=PROJECT_ROOT / "models" / "calm" / "vocab.txt")
+    p.add_argument("--per-species", type=int, default=0,
+                   help="Max sequences per species (0=all).")
+    p.add_argument("--max-tokens", type=int, default=4096,
+                   help="Truncate input_ids at bake time (0=no truncation).")
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
+
+    from proteinqc.data.tokenizer import CodonTokenizer
+    tokenizer = CodonTokenizer(args.vocab)
+
+    print("=" * 60)
+    print("  Bake EU11 Training + Validation Data")
+    print("=" * 60)
+    print(f"Species: {len(EU11_SPECIES)} (EU7 + 4 plants)")
+    print(f"Per-species cap: {args.per_species if args.per_species else 'unlimited'}")
+    print(f"Max tokens: {args.max_tokens if args.max_tokens else 'unlimited'}")
+
+    # ── Load EU11 training data ──
+    print("\n[Training data: EU11]")
+    train_data: dict[str, list] = {}
+
+    for species, dirname in EU11_SPECIES.items():
+        sp_dir = args.eu_dir / dirname
+        coding_fa = sp_dir / "coding.fa"
+        noncoding_fa = sp_dir / "noncoding.fa"
+
+        if not coding_fa.exists():
+            print(f"  {species}: MISSING {coding_fa}")
+            continue
+
+        records = []
+        print(f"  Loading {species}...", end=" ", flush=True)
+        t0 = time.time()
+
+        for header, seq in read_fasta(coding_fa):
+            aligned = codon_align_longest_orf(seq)
+            if len(aligned) >= 9:
+                records.append((header, aligned, 1))
+
+        if noncoding_fa.exists():
+            for header, seq in read_fasta(noncoding_fa):
+                aligned = codon_align_longest_orf(seq)
+                if len(aligned) >= 9:
+                    records.append((header, aligned, 0))
+
+        n_c = sum(1 for _, _, l in records if l == 1)
+        n_nc = len(records) - n_c
+        print(f"{len(records)} seqs ({n_c} cod / {n_nc} nc) in {time.time()-t0:.1f}s")
+        train_data[species] = records
+
+    # ── Load validation data (Chicken + Sorghum) ──
+    print("\n[Validation data: Chicken + Sorghum]")
+    val_data: dict[str, list] = {}
+
+    for species, info in VAL_SOURCES.items():
+        records = []
+        print(f"  Loading {species}...", end=" ", flush=True)
+        t0 = time.time()
+
+        for rel_path in info["coding"]:
+            fa_path = PROJECT_ROOT / rel_path
+            if fa_path.exists():
+                for header, seq in read_fasta(fa_path):
+                    aligned = codon_align_longest_orf(seq)
+                    if len(aligned) >= 9:
+                        records.append((header, aligned, 1))
+            else:
+                print(f"\n    WARNING: {fa_path} not found", end="")
+
+        for rel_path in info["noncoding"]:
+            fa_path = PROJECT_ROOT / rel_path
+            if fa_path.exists():
+                for header, seq in read_fasta(fa_path):
+                    aligned = codon_align_longest_orf(seq)
+                    if len(aligned) >= 9:
+                        records.append((header, aligned, 0))
+            else:
+                print(f"\n    WARNING: {fa_path} not found", end="")
+
+        n_c = sum(1 for _, _, l in records if l == 1)
+        n_nc = len(records) - n_c
+        print(f"{len(records)} seqs ({n_c} cod / {n_nc} nc) in {time.time()-t0:.1f}s")
+        val_data[species] = records
+
+    # ── Bake training split ──
+    print("\n[Baking training split]")
+    train_samples, train_stats = bake_split(
+        train_data, tokenizer, args.per_species,
+        max_tokens=args.max_tokens, seed=args.seed,
+    )
+
+    # ── Bake validation split ──
+    print("\n[Baking validation split]")
+    val_samples, val_stats = bake_split(
+        val_data, tokenizer, per_species=0,
+        max_tokens=args.max_tokens, seed=args.seed,
+    )
+
+    # ── Save ──
+    args.output.mkdir(parents=True, exist_ok=True)
+
+    train_path = args.output / "train.pt"
+    val_path = args.output / "val.pt"
+
+    print(f"\nSaving {len(train_samples)} train samples -> {train_path}")
+    torch.save(train_samples, train_path)
+
+    print(f"Saving {len(val_samples)} val samples -> {val_path}")
+    torch.save(val_samples, val_path)
+
+    manifest = {
+        "description": "EU11 train (EU7 + 4 plants) + Chicken/Sorghum val",
+        "per_species_cap": args.per_species,
+        "max_tokens": args.max_tokens,
+        "seed": args.seed,
+        "train": {
+            "file": "train.pt",
+            "total": len(train_samples),
+            "n_coding": sum(1 for s in train_samples if s["label"] == 1),
+            "n_noncoding": sum(1 for s in train_samples if s["label"] == 0),
+            "species": train_stats,
+        },
+        "val": {
+            "file": "val.pt",
+            "total": len(val_samples),
+            "n_coding": sum(1 for s in val_samples if s["label"] == 1),
+            "n_noncoding": sum(1 for s in val_samples if s["label"] == 0),
+            "species": val_stats,
+        },
+    }
+    manifest_path = args.output / "manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print("\n" + "=" * 60)
+    print("  Summary")
+    print("=" * 60)
+    tc = manifest["train"]["n_coding"]
+    tn = manifest["train"]["n_noncoding"]
+    vc = manifest["val"]["n_coding"]
+    vn = manifest["val"]["n_noncoding"]
+    print(f"Train: {len(train_samples):,} samples ({tc:,} coding / {tn:,} noncoding)")
+    print(f"  Species: {', '.join(sorted(train_stats.keys()))}")
+    print(f"Val:   {len(val_samples):,} samples ({vc:,} coding / {vn:,} noncoding)")
+    print(f"  Species: {', '.join(sorted(val_stats.keys()))}")
+    print(f"Files: {train_path}, {val_path}")
+    print(f"Manifest: {manifest_path}")
+    sz_train = train_path.stat().st_size / 1e6
+    sz_val = val_path.stat().st_size / 1e6
+    print(f"Size: {sz_train:.1f} MB train + {sz_val:.1f} MB val")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

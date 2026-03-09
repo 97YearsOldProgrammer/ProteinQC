@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Download 4 plant species from Ensembl Plants for EU11 training.
+
+Downloads coding (cdna) and noncoding (ncrna) FASTA for:
+  - rice (Oryza sativa)
+  - maize (Zea mays)
+  - tomato (Solanum lycopersicum)
+  - soybean (Glycine max)
+
+Filters out sequences <30nt and writes to data/eu7/{species}/.
+
+Usage:
+    bin/download-plants              # download all 4
+    bin/download-plants --species rice maize  # subset
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import hashlib
+import subprocess
+import tempfile
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+PLANTS = {
+    "rice": {
+        "latin": "Oryza sativa (Japonica)",
+        "coding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/oryza_sativa/cdna/Oryza_sativa.IRGSP-1.0.cdna.all.fa.gz",
+        "noncoding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/oryza_sativa/ncrna/Oryza_sativa.IRGSP-1.0.ncrna.fa.gz",
+    },
+    "maize": {
+        "latin": "Zea mays",
+        "coding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/zea_mays/cdna/Zea_mays.Zm-B73-REFERENCE-NAM-5.0.cdna.all.fa.gz",
+        "noncoding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/zea_mays/ncrna/Zea_mays.Zm-B73-REFERENCE-NAM-5.0.ncrna.fa.gz",
+    },
+    "tomato": {
+        "latin": "Solanum lycopersicum",
+        "coding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/solanum_lycopersicum/cdna/Solanum_lycopersicum.SL3.0.cdna.all.fa.gz",
+        "noncoding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/solanum_lycopersicum/ncrna/Solanum_lycopersicum.SL3.0.ncrna.fa.gz",
+    },
+    "soybean": {
+        "latin": "Glycine max",
+        "coding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/glycine_max/cdna/Glycine_max.Glycine_max_v2.1.cdna.all.fa.gz",
+        "noncoding_url": "https://ftp.ensemblgenomes.org/pub/plants/release-60/fasta/glycine_max/ncrna/Glycine_max.Glycine_max_v2.1.ncrna.fa.gz",
+    },
+}
+
+MIN_SEQ_LEN = 30
+
+
+def download_and_decompress(url: str, out_path: Path) -> str:
+    """Download gzipped FASTA via curl, decompress, return sha256."""
+    print(f"    Downloading {url.split('/')[-1]}...")
+    with tempfile.NamedTemporaryFile(suffix=".fa.gz", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    subprocess.run(
+        ["curl", "-fSL", "-k", "--retry", "3", "-o", str(tmp_path), url],
+        check=True,
+    )
+
+    sha = hashlib.sha256()
+    with gzip.open(tmp_path, "rt") as gz_in, open(out_path, "w") as out:
+        for line in gz_in:
+            sha.update(line.encode())
+            out.write(line)
+
+    tmp_path.unlink()
+    return sha.hexdigest()
+
+
+def filter_fasta(path: Path, min_len: int = MIN_SEQ_LEN) -> tuple[int, int]:
+    """Filter FASTA in-place, removing sequences shorter than min_len.
+
+    Returns (total_before, kept_after).
+    """
+    records: list[tuple[str, str]] = []
+    header = ""
+    seq_parts: list[str] = []
+
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if header and seq_parts:
+                    records.append((header, "".join(seq_parts)))
+                header = line
+                seq_parts = []
+            elif line:
+                seq_parts.append(line)
+    if header and seq_parts:
+        records.append((header, "".join(seq_parts)))
+
+    total = len(records)
+    kept = [(h, s) for h, s in records if len(s) >= min_len]
+
+    with open(path, "w") as f:
+        for header, seq in kept:
+            f.write(f"{header}\n")
+            for i in range(0, len(seq), 80):
+                f.write(seq[i:i+80] + "\n")
+
+    return total, len(kept)
+
+
+def length_stats(path: Path) -> dict:
+    """Compute length bins for a FASTA file."""
+    lengths: list[int] = []
+    seq_parts: list[str] = []
+
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if seq_parts:
+                    lengths.append(sum(len(p) for p in seq_parts))
+                seq_parts = []
+            elif line:
+                seq_parts.append(line)
+    if seq_parts:
+        lengths.append(sum(len(p) for p in seq_parts))
+
+    import numpy as np
+    arr = np.array(lengths) if lengths else np.array([0])
+    return {
+        "count": len(lengths),
+        "median_len": int(np.median(arr)),
+        "short_lt300": int(np.sum(arr < 300)),
+        "medium_300_1000": int(np.sum((arr >= 300) & (arr < 1000))),
+        "long_gte1000": int(np.sum(arr >= 1000)),
+    }
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Download plant species for EU11")
+    p.add_argument("--species", nargs="*", default=list(PLANTS.keys()),
+                   choices=list(PLANTS.keys()))
+    p.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data" / "eu7")
+    args = p.parse_args()
+
+    import json
+
+    print("=" * 60)
+    print("  Download Plant Species for EU11")
+    print("=" * 60)
+
+    manifest_entries = []
+
+    for species in args.species:
+        info = PLANTS[species]
+        sp_dir = args.output_dir / species
+        sp_dir.mkdir(parents=True, exist_ok=True)
+
+        coding_fa = sp_dir / "coding.fa"
+        noncoding_fa = sp_dir / "noncoding.fa"
+
+        print(f"\n[{species}] ({info['latin']})")
+
+        # Download
+        if coding_fa.exists():
+            print(f"    coding.fa already exists, skipping download")
+        else:
+            coding_sha = download_and_decompress(info["coding_url"], coding_fa)
+            total, kept = filter_fasta(coding_fa)
+            print(f"    coding: {total} -> {kept} seqs (filtered <{MIN_SEQ_LEN}nt)")
+
+        if noncoding_fa.exists():
+            print(f"    noncoding.fa already exists, skipping download")
+        else:
+            noncoding_sha = download_and_decompress(info["noncoding_url"], noncoding_fa)
+            total, kept = filter_fasta(noncoding_fa)
+            print(f"    noncoding: {total} -> {kept} seqs (filtered <{MIN_SEQ_LEN}nt)")
+
+        # Stats
+        c_stats = length_stats(coding_fa)
+        nc_stats = length_stats(noncoding_fa)
+        print(f"    coding:    {c_stats['count']} seqs, median {c_stats['median_len']}nt")
+        print(f"    noncoding: {nc_stats['count']} seqs, median {nc_stats['median_len']}nt")
+
+        entry = {
+            "species": species,
+            "latin": info["latin"],
+            "source": "Ensembl Plants",
+            "version": "release-60",
+            "coding_url": info["coding_url"],
+            "coding_count": c_stats["count"],
+            "coding_length_bins": c_stats,
+            "noncoding_url": info["noncoding_url"],
+            "noncoding_count": nc_stats["count"],
+            "noncoding_length_bins": nc_stats,
+        }
+        manifest_entries.append(entry)
+
+        # Per-species manifest
+        with open(sp_dir / "manifest.json", "w") as f:
+            json.dump(entry, f, indent=2)
+
+    print("\n" + "=" * 60)
+    print("  Done. New species directories:")
+    for sp in args.species:
+        print(f"    {args.output_dir / sp}/")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

@@ -2,9 +2,9 @@
 
 Usage:
     python -m proteinqc.cli.visualize_combiner \
-        --model models/combiner/xgb_v1.json \
+        --model models/combiner/xgb_v2.json \
         --data data/features/all_datasets.parquet \
-        --baseline-json data/results/benchmark_multispecies_longest_orf.json \
+        --baseline-json data/results/benchmark_zeroshot.json \
         --output-dir data/results/figures/
 """
 

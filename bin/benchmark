@@ -1,5 +1,0 @@
-#!/usr/bin/env python3
-"""Benchmark RNA classification heads."""
-from proteinqc.cli.benchmark import main
-
-main()

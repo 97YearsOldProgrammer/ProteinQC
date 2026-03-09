@@ -121,13 +121,16 @@ def batched_inference(
 
 def load_dataset_sequences(
     ds: dict, align_fn, max_seqs: int = 0,
-) -> tuple[list[str], list[int]]:
-    """Load and align sequences from a dataset pair."""
+) -> tuple[list[str], list[int], list[str]]:
+    """Load and align sequences from a dataset pair.
+
+    Returns (sequences, labels, sequence_ids).
+    """
     half = max_seqs // 2 if max_seqs else 0
 
     if "mixed" in ds:
         if not ds["mixed"].exists():
-            return [], []
+            return [], [], []
         all_records = read_fasta(ds["mixed"], max_seqs=0)
         coding_records = [
             (h, s) for h, s in all_records if "NM_" in h or "mRNA" in h.lower()
@@ -144,23 +147,25 @@ def load_dataset_sequences(
         noncoding_paths = ds["noncoding"] if isinstance(ds["noncoding"], list) else [ds["noncoding"]]
         missing = [p for p in coding_paths + noncoding_paths if not Path(p).exists()]
         if missing:
-            return [], []
+            return [], [], []
         coding_records = read_fasta_multi(ds["coding"], max_seqs=half)
         noncoding_records = read_fasta_multi(ds["noncoding"], max_seqs=half)
 
-    sequences, labels = [], []
-    for _, seq in coding_records:
+    sequences, labels, seq_ids = [], [], []
+    for header, seq in coding_records:
         aligned = align_fn(seq)
         if len(aligned) >= 9:
             sequences.append(aligned)
             labels.append(1)
-    for _, seq in noncoding_records:
+            seq_ids.append(header.split()[0])
+    for header, seq in noncoding_records:
         aligned = align_fn(seq)
         if len(aligned) >= 9:
             sequences.append(aligned)
             labels.append(0)
+            seq_ids.append(header.split()[0])
 
-    return sequences, labels
+    return sequences, labels, seq_ids
 
 
 def parse_args() -> argparse.Namespace:
@@ -251,7 +256,7 @@ def main() -> None:
         ds_name = f"{ds['tool']}/{ds['species']}"
         print(f"\n[{i+1}/{len(datasets)}] {ds_name}", end="", flush=True)
 
-        sequences, labels = load_dataset_sequences(ds, align_fn, args.max_seqs)
+        sequences, labels, seq_ids = load_dataset_sequences(ds, align_fn, args.max_seqs)
         if len(sequences) < 10:
             print(f"  SKIP ({len(sequences)} seqs)")
             continue
@@ -285,6 +290,7 @@ def main() -> None:
         for j in range(len(sequences)):
             all_scores.append({
                 "dataset": ds_name,
+                "sequence_id": seq_ids[j],
                 "label": labels[j],
                 "calm_score": float(probs[j]),
                 "seq_length": len(sequences[j]),
@@ -352,13 +358,37 @@ def main() -> None:
         }, f, indent=2)
     print(f"\nResults saved to {args.output}")
 
-    # Save per-sequence scores for XGBoost
+    # Save per-sequence scores and merge into existing feature parquets
     if all_scores:
         import pandas as pd
+        scores_df = pd.DataFrame(all_scores)
         scores_path = args.output.with_name("benchmark_zeroshot_scores.parquet")
-        df = pd.DataFrame(all_scores)
-        df.to_parquet(scores_path, index=False)
-        print(f"Scores saved to {scores_path} ({len(df):,} rows)")
+        scores_df.to_parquet(scores_path, index=False)
+        print(f"Scores saved to {scores_path} ({len(scores_df):,} rows)")
+
+        # Merge into existing feature parquets
+        features_dir = PROJECT_ROOT / "data" / "features"
+        if features_dir.exists():
+            n_updated = 0
+            for pq_path in sorted(features_dir.glob("*.parquet")):
+                if pq_path.name in ("all_datasets.parquet",
+                                    "benchmark_zeroshot_scores.parquet"):
+                    continue
+                feat_df = pd.read_parquet(pq_path)
+                if "dataset" not in feat_df.columns or "sequence_id" not in feat_df.columns:
+                    continue
+                ds_name = feat_df["dataset"].iloc[0]
+                ds_scores = scores_df[scores_df["dataset"] == ds_name]
+                if ds_scores.empty:
+                    continue
+                score_map = dict(zip(ds_scores["sequence_id"], ds_scores["calm_score"]))
+                matched = feat_df["sequence_id"].isin(score_map)
+                if matched.sum() == 0:
+                    continue
+                feat_df.loc[matched, "calm_score"] = feat_df.loc[matched, "sequence_id"].map(score_map)
+                feat_df.to_parquet(pq_path, index=False)
+                n_updated += 1
+            print(f"Updated calm_score in {n_updated} feature parquets")
 
     # Clean up partial
     partial = args.output.with_suffix(".partial.json")

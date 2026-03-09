@@ -13,7 +13,6 @@ from proteinqc.models.classification_heads import (
     LinearHead,
     MLPHead,
 )
-from proteinqc.models.norm_convert import convert_layernorm_to_rmsnorm
 from proteinqc.pipeline import EnrichedORF, ORFPipeline, ScoredORF
 
 __all__ = [
@@ -23,7 +22,6 @@ __all__ = [
     "LinearHead",
     "MLPHead",
     "GatedHead",
-    "convert_layernorm_to_rmsnorm",
     "ORFPipeline",
     "ScoredORF",
 ]

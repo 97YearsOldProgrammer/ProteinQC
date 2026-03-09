@@ -214,10 +214,11 @@ def evaluate_per_dataset(
 
     if baseline_json and baseline_json.exists():
         with open(baseline_json) as f:
-            baseline = json.load(f)
+            raw = json.load(f)
+        entries = raw.get("per_dataset", raw) if isinstance(raw, dict) else raw
         baseline_map = {
-            f"{e['tool']}/{e['species']}": e.get("mlp_cls", {}).get("ACC")
-            for e in baseline
+            e["dataset"]: e.get("ACC") or e.get("mlp_cls", {}).get("ACC")
+            for e in entries
         }
         res_df["calm_acc"] = res_df["dataset"].map(baseline_map)
         res_df["delta"] = res_df["ACC"] - res_df["calm_acc"].fillna(res_df["ACC"])

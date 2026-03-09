@@ -96,8 +96,8 @@ def main() -> None:
                         help="Output JSONL path")
     parser.add_argument("--calm-dir", default="models/calm",
                         help="CaLM model directory")
-    parser.add_argument("--head-path", default="models/heads/gated_head_v1.pt",
-                        help="MLP head weights path")
+    parser.add_argument("--head-path", default="models/heads/lora_alibi_gated_v1",
+                        help="Classification head weights path")
     parser.add_argument("--pfam-db", default=None,
                         help="Pfam-A.hmm path (optional)")
     parser.add_argument("--skip-pfam", action="store_true",

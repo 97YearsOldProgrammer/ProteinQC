@@ -24,6 +24,9 @@ try:
 except ImportError:
     _HAS_FLASH_ATTN = False
 
+# ALiBi slopes cache for FlashAttention (computed once, reused)
+_FA_ALIBI_SLOPES: dict[int, torch.Tensor] = {}
+
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate pairs: [-x2, x1] for RoPE."""
@@ -166,24 +169,34 @@ class TransformerLayer(nn.Module):
         if cos is not None and sin is not None:
             q, k = _apply_rope(q, k, cos, sin)
 
-        if alibi_bias is not None:
-            # Combine padding mask + ALiBi bias into a single additive mask
-            # attn_mask [B,1,1,S] bool → convert to float: 0 where valid, -inf where pad
-            pad_bias = torch.zeros_like(attn_mask, dtype=q.dtype)
-            pad_bias = pad_bias.masked_fill(~attn_mask, float("-inf"))
-            sdpa_mask = pad_bias + alibi_bias[:, :, :q.shape[2], :q.shape[2]]
-        else:
-            sdpa_mask = attn_mask
-
-        if _HAS_FLASH_ATTN and q.is_cuda and alibi_bias is None:
-            # FlashAttention path (RoPE only — FA doesn't accept custom bias)
+        if _HAS_FLASH_ATTN and q.is_cuda:
+            # FlashAttention path — supports both RoPE and ALiBi
             fa_dtype = torch.bfloat16
-            q = q.transpose(1, 2).to(fa_dtype)
-            k = k.transpose(1, 2).to(fa_dtype)
-            v = v.transpose(1, 2).to(fa_dtype)
-            attn_out = flash_attn_func(q, k, v, causal=False)
+            q_fa = q.transpose(1, 2).to(fa_dtype)
+            k_fa = k.transpose(1, 2).to(fa_dtype)
+            v_fa = v.transpose(1, 2).to(fa_dtype)
+
+            fa_kwargs: dict = {"causal": False}
+            if alibi_bias is not None:
+                # FA2 native ALiBi: pass slopes directly, avoids O(seq²) bias matrix
+                nh = self.num_heads
+                if nh not in _FA_ALIBI_SLOPES:
+                    _FA_ALIBI_SLOPES[nh] = _alibi_slopes(nh)
+                fa_kwargs["alibi_slopes"] = _FA_ALIBI_SLOPES[nh].to(
+                    device=q.device, dtype=torch.float32,
+                )
+
+            attn_out = flash_attn_func(q_fa, k_fa, v_fa, **fa_kwargs)
             attn_out = attn_out.to(x.dtype).reshape(x.shape)
         else:
+            # SDPA fallback (MPS / CPU / no FlashAttention)
+            if alibi_bias is not None:
+                pad_bias = torch.zeros_like(attn_mask, dtype=q.dtype)
+                pad_bias = pad_bias.masked_fill(~attn_mask, float("-inf"))
+                sdpa_mask = pad_bias + alibi_bias[:, :, :q.shape[2], :q.shape[2]]
+            else:
+                sdpa_mask = attn_mask
+
             attn_out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=sdpa_mask,

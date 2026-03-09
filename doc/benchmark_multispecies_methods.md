@@ -3,14 +3,13 @@
 ## 1. Overview
 
 We evaluated the CaLM (Codon-Aware Language Model) encoder on independent benchmark
-datasets from 9 published RNA classification tools, spanning 16 species and covering
+datasets from 19 published RNA classification suites, spanning 57 species and covering
 both animal and plant kingdoms. This evaluation tests whether CaLM's codon-level
 representations, learned from pre-training on codon sequences, generalize to coding
 vs. non-coding RNA classification across diverse taxa without tool-specific retraining.
 
-All datasets are entirely independent from the RNA Challenge training set used to
-train the MLP classification head. This separation enables a clean assessment of
-both zero-shot transfer (MLP head) and representation quality (linear probe).
+All 80 datasets are entirely independent from the EU7 training set used to train
+the LoRA ALiBi GatedHead. This separation enables a clean zero-shot assessment.
 
 ## 2. CaLM Encoder
 
@@ -337,35 +336,22 @@ codon tokens from CaLM's vocabulary.
 
 Each dataset is evaluated in two independent modes:
 
-**Mode 1: MLP Head Zero-Shot Transfer (from RNA Challenge)**
+**Zero-Shot Transfer (LoRA ALiBi GatedHead)**
 
-The pre-trained MLP classification head, trained on the RNA Challenge dataset
-(27,283 sequences: 16,243 coding + 11,040 non-coding, CDS-only sequences from
-multi-species RefSeq/Ensembl sources), is applied directly to each benchmark
-dataset without any retraining. This tests whether the decision boundary learned
-on one data distribution transfers to another.
+The LoRA ALiBi GatedHead, trained on the EU7 dataset (5 species train, 2 heldout),
+is applied directly to each of the 80 benchmark datasets without any retraining.
+This tests whether the decision boundary learned on one data distribution
+transfers across 57 species and diverse transcript formats.
 
-The MLP head architecture is:
+The classification head architecture is:
 ```
-Linear(768, 256) -> GELU -> Dropout(0.1) ->
-Linear(256, 256) -> GELU -> Dropout(0.1) ->
-Linear(256, 1)
+CaLM encoder (frozen, 85.75M params)
+  + LoRA adapters (r=8, alpha=16, q/k/v_proj — 442K params)
+  + ALiBi position encoding (no sequence length limit)
+  → [CLS] embedding (768-dim)
+  → GatedHead: gate(σ) routes between Linear(768→1) and MLP(768→256→256→1)
 ```
-Weights loaded from `models/heads/mlp_head_v1.pt`.
-
-**Mode 2: Fresh Linear Probe (per-dataset)**
-
-A single-layer linear probe (`nn.Linear(768, 1)`) is trained from scratch on
-each dataset independently, using an 80/20 random split (seed=42). This
-evaluates the intrinsic quality of CaLM's [CLS] representations for separating
-coding from non-coding sequences, independent of any prior training distribution.
-
-Linear probe training:
-- Optimizer: Adam, lr=1e-3
-- Loss: BCEWithLogitsLoss
-- Epochs: 50 (on the 80% training split)
-- Weight init: N(0, 0.02), bias=0
-- No regularization beyond early stopping at 50 epochs
+Weights loaded from `models/heads/lora_alibi_gated_v1/`.
 
 ### 5.2 Embedding Extraction
 
@@ -408,34 +394,23 @@ indicating random performance.
 | PyTorch | >= 2.0 |
 | Random seed | 42 (torch + numpy) |
 
-## 6. Key Finding: Domain Mismatch
+## 6. Key Findings
 
-The most notable result is the systematic failure of the MLP head (Mode 1) on
-these independent datasets, contrasted with reasonable performance of the
-linear probe (Mode 2).
+**Zero-shot performance (80 datasets, 2.1M sequences):**
+- Mean accuracy: 83.8%
+- Mean AUC: 92.5%
 
-**MLP head mean performance**: ACC ~21%, MCC ~ -50% (inverted predictions)
+**Strong performance (>90% ACC):** LGC-RefSeq Vertebrates (99.1%), Invertebrates
+(97.5%), Plants (96.8%), Tomato (95.5%), C. elegans (95.1%), CPAT Human (93-94%).
 
-**Linear probe mean performance**: ACC ~77%, MCC ~ +55% (meaningful separation)
+**Weak spots:** Short sequences (<300nt) remain the primary failure mode. CaLM
+scores noncoding sequences HIGHER than coding on short datasets (inverted signal).
+The XGBoost combiner compensates by routing through ORF fraction and other
+non-neural features.
 
-The MLP head was trained on the RNA Challenge dataset, which contains primarily
-**CDS-only** sequences (coding sequences trimmed to the open reading frame,
-without UTRs). The independent benchmark datasets contain **full-length mRNA
-transcripts** including 5'UTR + CDS + 3'UTR. This distribution mismatch causes
-the MLP head to systematically misclassify coding transcripts as non-coding:
-when a full-length mRNA is fed to CaLM, the 5'UTR and 3'UTR regions produce
-codon tokens that resemble non-coding patterns, overwhelming the CDS signal.
-
-The linear probe, trained fresh on each dataset's own distribution, learns the
-correct decision boundary for full-length transcripts and achieves substantially
-better classification. This demonstrates that CaLM's [CLS] embeddings DO contain
-discriminative information for coding vs. non-coding classification across diverse
-species, but the decision boundary learned on CDS-only data does not transfer to
-full-length transcript data.
-
-**Implication**: For fair cross-dataset evaluation, the linear probe (Mode 2) is
-the appropriate metric. The MLP head results quantify the domain shift between
-CDS-only and full-length transcript distributions.
+**Plant species** show mixed results: LGC-RefSeq Plants score 96.8%, but
+RNAplonc individual species range from 60-71%. CaLM was pre-trained primarily
+on vertebrate/model organism codon usage.
 
 ## 7. Dataset Summary
 
@@ -454,8 +429,8 @@ CDS-only and full-length transcript distributions.
 *lncRNAnet is present in the data directory but excluded from the benchmark because
 it lacks paired coding sequences.
 
-**Grand total (used in benchmark)**: ~368,702 sequences across 28 dataset pairs
-from 8 tools and 16 species.
+**Grand total (used in benchmark)**: ~2.1M sequences across 80 dataset pairs
+from 19 benchmark suites and 57 species.
 
 ## 8. Reference
 
@@ -473,6 +448,5 @@ tools from their collection, testing whether a single pre-trained codon-level la
 model (CaLM) can provide universal representations that generalize across these
 diverse datasets.
 
-The `doc/benchmark_report.tsv` file in this repository contains performance results
-for 60 tool/model combinations evaluated on the RNA Challenge dataset, which serves
-as the baseline for comparison.
+Full zero-shot results are in `data/results/benchmark_zeroshot.json` with per-sequence
+scores in `data/results/benchmark_zeroshot_scores.parquet`.

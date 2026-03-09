@@ -276,8 +276,8 @@ def batched_forward(
 
         batch_samples = [samples[sorted_indices[j]] for j in range(i, i + bs)]
         batch = collate_binary(batch_samples)
-        ids = batch["input_ids"].to(device)
-        mask = batch["attention_mask"].to(device)
+        ids = batch["input_ids"].to(device, non_blocking=True)
+        mask = batch["attention_mask"].to(device, non_blocking=True)
 
         with torch.no_grad():
             logits = raw(ids, mask)
@@ -306,6 +306,7 @@ def train_lora(
     patience: int = 3,
     log_interval: int = 100,
     focal_gamma: float = 2.0,
+    output_dir: Path | None = None,
 ) -> list[dict]:
     """Train LoRA adapters + head jointly. Supports DDP."""
     raw = unwrap(model)
@@ -362,9 +363,9 @@ def train_lora(
         for batch in token_budget_batcher(
             my_samples, token_budget, max_batch, collate_binary,
         ):
-            ids = batch["input_ids"].to(device)
-            mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device, dtype=torch.float32)
+            ids = batch["input_ids"].to(device, non_blocking=True)
+            mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, dtype=torch.float32, non_blocking=True)
 
             logits = model(ids, mask)
             loss = criterion(logits, labels)
@@ -463,6 +464,12 @@ def train_lora(
             best_head_state = {
                 k: v.cpu().clone() for k, v in raw.head.state_dict().items()
             }
+            # Save checkpoint immediately so progress survives crashes
+            if output_dir is not None and is_main_process():
+                output_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(best_encoder_state, output_dir / "adapter_model.pt")
+                torch.save(best_head_state, output_dir / "head.pt")
+                print(f"  Checkpoint saved (epoch {epoch+1}, val_acc={val_acc:.1f}%)")
             wait = 0
         else:
             wait += 1
@@ -545,6 +552,11 @@ def main() -> None:
     np.random.seed(args.seed)
 
     device = select_device()
+
+    # CUDA performance flags
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")  # TF32 for residual FP32 ops
+        torch.backends.cudnn.benchmark = True        # autotuner for stable bucket shapes
 
     if is_main_process():
         print("=" * 70)
@@ -727,6 +739,7 @@ def main() -> None:
         patience=args.patience,
         log_interval=args.log_interval,
         focal_gamma=args.focal_gamma,
+        output_dir=args.output,
     )
     train_time = time.time() - t0
 

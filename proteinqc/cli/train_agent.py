@@ -132,8 +132,8 @@ def main() -> None:
     # Tool backends
     parser.add_argument("--calm-dir", default="models/calm",
                         help="CaLM model directory")
-    parser.add_argument("--head-path", default="models/heads/mlp_head_v1.pt",
-                        help="MLP head weights path")
+    parser.add_argument("--head-path", default="models/heads/lora_alibi_gated_v1",
+                        help="Classification head weights path")
     parser.add_argument("--pfam-db", default=None,
                         help="Pfam-A.hmm path (optional)")
 

@@ -40,8 +40,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--head-path",
-        default="models/heads/mlp_head_v1.pt",
-        help="Path to MLP head weights",
+        default="models/heads/lora_alibi_gated_v1",
+        help="Path to classification head weights",
     )
     p.add_argument(
         "--pfam-db",
