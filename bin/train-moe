@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Launch CaLM-MoE distributed training on 2 DGX Spark nodes.
+#
+# Usage (from spark-1089 gt5 container):
+#   bash bin/train-moe                    # 2-node DDP
+#   bash bin/train-moe --single           # single-node only
+#
+# Prerequisites:
+#   1. Run upcycling first: python -m proteinqc.cli.upcycle_moe
+#   2. Baked data at data/baked/eu8/{train.pt, val.pt}
+#   3. proteinqc installed on both nodes
+
+set -euo pipefail
+cd /workspace/Code/ProteinQC
+
+export PYTHONUNBUFFERED=1
+
+# ── NCCL config for RoCE ──
+export NCCL_SOCKET_IFNAME=enp1s0f1np1
+export NCCL_IB_TIMEOUT=22
+export NCCL_IB_RETRY_CNT=7
+export NCCL_NET_GDR_LEVEL=0
+export NCCL_NET_GDR_READ=0
+export NCCL_DEBUG=INFO
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+
+MASTER_ADDR=192.168.100.10
+MASTER_PORT=29500
+
+EPOCHS=4
+MOE_LR=1e-4
+HEAD_LR=1e-3
+GRAD_ACCUM=4
+
+# ── Memory config (UMA-aware) ──
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
+
+if [[ "${1:-}" == "--single" ]]; then
+    # 128GB UMA: push token budget & batch size to saturate bandwidth.
+    # Model+optimizer ~1.6GB, activations ~12GB at 131072 budget.
+    # Total ~15GB, leaves ~113GB headroom — no OOM risk on 128GB UMA.
+    TOKEN_BUDGET=131072
+    MAX_BATCH=4096
+
+    COMMON_ARGS="
+        --calm-dir models/calm
+        --moe-dir models/calm_moe
+        --baked-train data/baked/eu8/train.pt
+        --baked-val data/baked/eu8/val.pt
+        --output models/heads/moe_gated_v1
+        --epochs $EPOCHS
+        --moe-lr $MOE_LR
+        --head-lr $HEAD_LR
+        --token-budget $TOKEN_BUDGET
+        --max-batch $MAX_BATCH
+        --grad-accum $GRAD_ACCUM
+        --compile
+        --log-interval 50
+    "
+
+    echo "Single-node UMA training on $(hostname)"
+    echo "Token budget: $TOKEN_BUDGET  Max batch: $MAX_BATCH"
+    # --no-compile: GB10 SM_121 shared mem (99KB) too small for Inductor's
+    # fused layernorm+dropout backward kernel (needs 136KB). Eager is fine
+    # with large batches on UMA.
+    python -m proteinqc.cli.train_moe $COMMON_ARGS --no-compile
+else
+    # Distributed: smaller budget per node (split across 2 GPUs)
+    TOKEN_BUDGET=16384
+    MAX_BATCH=512
+
+    COMMON_ARGS="
+        --calm-dir models/calm
+        --moe-dir models/calm_moe
+        --baked-train data/baked/eu8/train.pt
+        --baked-val data/baked/eu8/val.pt
+        --output models/heads/moe_gated_v1
+        --epochs $EPOCHS
+        --moe-lr $MOE_LR
+        --head-lr $HEAD_LR
+        --token-budget $TOKEN_BUDGET
+        --max-batch $MAX_BATCH
+        --grad-accum $GRAD_ACCUM
+        --compile
+        --log-interval 50
+    "
+    NODE_RANK="${NODE_RANK:-0}"
+    NNODES=2
+
+    echo "Distributed training: node $NODE_RANK / $NNODES"
+    echo "Master: $MASTER_ADDR:$MASTER_PORT"
+
+    torchrun \
+        --nnodes=$NNODES \
+        --nproc_per_node=1 \
+        --node_rank=$NODE_RANK \
+        --master_addr=$MASTER_ADDR \
+        --master_port=$MASTER_PORT \
+        -m proteinqc.cli.train_moe $COMMON_ARGS
+fi
