@@ -227,6 +227,93 @@ def compute_metrics(
     return m
 
 
+# ── Token budget probing ─────────────────────────────────────────
+
+def probe_token_budget(
+    model: nn.Module,
+    device: torch.device,
+    start: int = 8192,
+    max_budget: int = 1_048_576,
+    safety: float = 0.85,
+) -> int:
+    """Find max token budget via forward+backward probing on GPU.
+
+    Doubles budget from *start* until peak memory exceeds 45% of total
+    GPU memory, then returns *safety* fraction of the last successful
+    budget (rounded down to 1024).
+
+    Never probes to OOM — on UMA systems the memory ratchet means a
+    failed allocation permanently reduces available memory.
+    """
+    import gc
+
+    max_sl = 1026
+    vocab = 131
+    total_gb = torch.cuda.get_device_properties(0).total_memory / (1 << 30)
+
+    print(f"\nProbing token budget (forward + backward)...")
+    print(f"  GPU total: {total_gb:.1f}GB")
+    best = 0
+    budget = start
+
+    was_training = model.training
+    model.train()
+
+    while budget <= max_budget:
+        bs = max(1, budget // max_sl)
+        sl = min(budget, max_sl)
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        ids = mask = labels = logits = loss = None
+        ok = False
+        peak_gb = 0.0
+        try:
+            ids = torch.randint(0, vocab, (bs, sl), device=device)
+            mask = torch.ones(bs, sl, dtype=torch.bool, device=device)
+            labels = torch.zeros(bs, device=device)
+            logits = model(ids, mask)
+            loss = F.binary_cross_entropy_with_logits(logits, labels)
+            loss.backward()
+            peak_gb = torch.cuda.max_memory_allocated() / (1 << 30)
+            ok = True
+        except torch.cuda.OutOfMemoryError:
+            pass
+
+        model.zero_grad(set_to_none=True)
+        del ids, mask, labels, logits, loss
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if ok:
+            print(f"  budget={budget:>8,}  bs={bs:>4}  sl={sl:>4}  "
+                  f"peak={peak_gb:.1f}GB ({peak_gb/total_gb:.0%})  OK")
+            best = budget
+            # Stop before OOM: if next 2x step would likely exceed GPU.
+            # On UMA, probing to OOM ratchets memory permanently.
+            if peak_gb > total_gb * 0.45:
+                print(f"  (next 2x would exceed ~90% GPU — stopping)")
+                break
+            budget *= 2
+        else:
+            print(f"  budget={budget:>8,}  bs={bs:>4}  sl={sl:>4}  OOM")
+            break
+
+    if not was_training:
+        model.eval()
+
+    if best == 0:
+        fallback = start // 2
+        print(f"  WARNING: even {start:,} OOMs — using {fallback:,}")
+        return fallback
+
+    final = max(1024, (int(best * safety) // 1024) * 1024)
+    print(f"\n  Max OK: {best:,}")
+    print(f"  Using:  {final:,} ({safety:.0%} safety margin)")
+    return final
+
+
 # ── Training loop ─────────────────────────────────────────────────
 
 def train_moe(
@@ -532,6 +619,16 @@ def main() -> None:
             state=None, hook=default_hooks.bf16_compress_hook,
         )
 
+    # Auto-detect token budget via GPU memory probing
+    token_budget = args.token_budget
+    max_batch = args.max_batch
+    if args.probe_budget and device.type == "cuda":
+        token_budget = probe_token_budget(model, device)
+        max_batch = max(max_batch, token_budget // 16)
+        if is_main_process():
+            print(f"Token budget: {token_budget:,}")
+            print(f"Max batch: {max_batch:,}")
+
     if is_main_process():
         print(f"\nLoading baked data...")
     tr_samples = torch.load(args.baked_train, weights_only=False)
@@ -548,8 +645,8 @@ def main() -> None:
     log = train_moe(
         model, tr_samples, val_samples, device,
         moe_start=moe_start,
-        token_budget=args.token_budget,
-        max_batch=args.max_batch,
+        token_budget=token_budget,
+        max_batch=max_batch,
         epochs=args.epochs,
         moe_lr=args.moe_lr,
         head_lr=args.head_lr,
@@ -579,8 +676,9 @@ def main() -> None:
                 "n_moe_params": n_moe,
                 "n_head_params": n_head,
                 "world_size": get_world_size(),
-                "token_budget": args.token_budget,
-                "max_batch": args.max_batch,
+                "token_budget": token_budget,
+                "max_batch": max_batch,
+                "budget_probed": args.probe_budget,
                 "moe_lr": args.moe_lr,
                 "head_lr": args.head_lr,
                 "compiled": args.compile,
@@ -622,6 +720,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--focal-gamma", type=float, default=2.0)
     p.add_argument("--compile", action=argparse.BooleanOptionalAction,
                    default=True)
+    p.add_argument("--probe-budget", action="store_true",
+                   help="Auto-detect token budget via GPU memory probing")
     p.add_argument("--log-interval", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()

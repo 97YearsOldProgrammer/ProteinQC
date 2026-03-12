@@ -1,9 +1,10 @@
 """Classification heads for binary RNA classification (coding vs non-coding).
 
-Three architectures:
+Four architectures:
 1. LinearHead: Single linear layer (logistic regression)
 2. MLPHead: Deep 3-layer MLP with GELU and dropout
 3. GatedHead: Gated mixture of LinearHead and MLPHead with learned routing
+4. MoEHead: Top-k mixture-of-experts with N small MLP experts + router
 
 All heads use BERT-style N(0, 0.02) initialization matching CaLM's
 initializer_range config. Biases initialized to zero.
@@ -11,6 +12,7 @@ initializer_range config. Biases initialized to zero.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 INIT_STD = 0.02  # CaLM config: initializer_range = 0.02
 
@@ -202,4 +204,133 @@ class GatedHead(nn.Module):
             "gate_max": g.max().item(),
             "pct_shortcut": (g < 0.5).float().mean().item() * 100,
             "pct_mlp": (g >= 0.5).float().mean().item() * 100,
+        }
+
+
+class MoEHead(nn.Module):
+    """Mixture-of-Experts classification head with GatedHead experts.
+
+    Each expert is a full GatedHead (gate + shortcut + MLP). A top-k router
+    selects which expert handles each sample. With 2 experts and top-1,
+    the router learns to split sequences into two populations, each with
+    its own internal gate routing between shortcut and MLP paths.
+
+    Architecture:
+        [CLS] embedding (768-dim)
+              ↓
+        Router (768 → num_experts) → softmax → top-k
+              ↓
+        ┌─────┴─────┐
+        Expert 0    Expert 1    (each is a GatedHead)
+        (GatedHead) (GatedHead)
+        └─────┬─────┘
+              ↓
+        weighted logit
+
+    Args:
+        hidden_size: Input embedding dimension (default: 768 for CaLM).
+        expert_hidden: Per-expert MLP hidden size (default: 394).
+        num_experts: Number of GatedHead experts (default: 2).
+        top_k: Experts activated per sample (default: 1).
+        dropout: Dropout probability for expert MLPs (default: 0.1).
+        balance_coeff: Load-balancing loss weight (default: 0.01).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 768,
+        expert_hidden: int = 394,
+        num_experts: int = 2,
+        top_k: int = 1,
+        dropout: float = 0.1,
+        balance_coeff: float = 0.01,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.balance_coeff = balance_coeff
+
+        self.router = nn.Linear(hidden_size, num_experts, bias=False)
+        nn.init.normal_(self.router.weight, mean=0.0, std=INIT_STD)
+
+        self.experts = nn.ModuleList([
+            GatedHead(hidden_size, expert_hidden, dropout, balance_loss_weight=0.0)
+            for _ in range(num_experts)
+        ])
+
+        self._last_balance_loss = torch.tensor(0.0)
+        self._last_load: torch.Tensor | None = None
+        self._last_assignments: torch.Tensor | None = None
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Forward pass with top-k GatedHead expert routing.
+
+        Args:
+            hidden_state: [batch, hidden_size] CLS embeddings
+
+        Returns:
+            logits: [batch, 1] raw logits
+        """
+        B = hidden_state.shape[0]
+
+        # Route
+        router_logits = self.router(hidden_state)  # [B, E]
+        router_probs = torch.softmax(router_logits, dim=-1)
+
+        top_weights, top_indices = torch.topk(
+            router_probs, self.top_k, dim=-1,
+        )  # [B, top_k]
+        top_weights = top_weights / top_weights.sum(dim=-1, keepdim=True)
+
+        if self.training:
+            self._compute_balance_loss(router_probs, top_indices)
+
+        self._last_assignments = top_indices.detach()
+
+        # Dispatch to experts (loop over experts, mask samples)
+        logits = torch.zeros(B, 1, device=hidden_state.device, dtype=hidden_state.dtype)
+
+        for k in range(self.top_k):
+            expert_ids = top_indices[:, k]  # [B]
+            weights = top_weights[:, k : k + 1]  # [B, 1]
+
+            for e in range(self.num_experts):
+                mask = expert_ids == e
+                if not mask.any():
+                    continue
+                expert_out = self.experts[e](hidden_state[mask])  # [n_e, 1]
+                logits[mask] += weights[mask] * expert_out
+
+        return logits
+
+    def _compute_balance_loss(
+        self, router_probs: torch.Tensor, top_indices: torch.Tensor,
+    ) -> None:
+        """Switch Transformer load-balancing loss."""
+        N = self.num_experts
+        flat_experts = top_indices.reshape(-1)
+        one_hot = F.one_hot(flat_experts, num_classes=N).float()
+        f = one_hot.mean(dim=0)
+        P = router_probs.mean(dim=0)
+
+        self._last_balance_loss = self.balance_coeff * N * (f * P).sum()
+        self._last_load = f.detach()
+
+    def get_balance_loss(self) -> torch.Tensor:
+        return self._last_balance_loss
+
+    def get_load_stats(self) -> dict[str, float]:
+        if self._last_load is None:
+            return {}
+        load = self._last_load
+        return {
+            f"expert_{i}_frac": load[i].item()
+            for i in range(self.num_experts)
+        }
+
+    def get_expert_gate_stats(self) -> dict[str, dict[str, float]]:
+        """Get internal gate stats from each GatedHead expert."""
+        return {
+            f"expert_{i}": self.experts[i].get_gate_stats()
+            for i in range(self.num_experts)
         }

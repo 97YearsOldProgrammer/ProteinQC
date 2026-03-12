@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Train CaLM-MoE8 top-2 on spark-0b7c (single node).
+#
+# MoE config: 8 experts, top-2, expert_intermediate=1536
+#   -> activated params per token = 2 × 1536 = 3072 (same as dense FFN)
+#   -> total expert capacity = 8 × 1536 = 4× dense, more routing diversity
+#
+# Token budget auto-probed — no manual estimation needed.
+#
+# Usage (from Mac):
+#   bin/spark exec --worker "nohup bash bin/train-moe-v2 > /workspace/logs/moe8_top2.log 2>&1 &"
+#
+# Or inside gt5 container on spark-0b7c:
+#   bash bin/train-moe-v2
+
+set -euo pipefail
+cd /workspace/Code/ProteinQC
+
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
+
+MOE_DIR=models/calm_moe8_top2
+OUTPUT=models/heads/moe8_top2_v1
+
+EPOCHS=4
+MOE_LR=1e-4
+HEAD_LR=1e-3
+GRAD_ACCUM=4
+
+# ── Step 1: Upcycle MoE8 top-2 (if needed) ──
+if [[ ! -f "$MOE_DIR/model_moe.pt" ]]; then
+    echo "============================================================"
+    echo "  Upcycling: 8 experts, top-2, intermediate=1536"
+    echo "============================================================"
+    python -m proteinqc.cli.upcycle_moe \
+        --model-dir models/calm \
+        --output "$MOE_DIR" \
+        --num-experts 8 \
+        --top-k 2 \
+        --expert-intermediate 1536
+    echo ""
+fi
+
+# ── Step 2: Train with auto-probed token budget ──
+echo "============================================================"
+echo "  Training CaLM-MoE8 top-2"
+echo "  $(hostname) — $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo 'GPU info unavailable')"
+echo "============================================================"
+
+python -m proteinqc.cli.train_moe \
+    --calm-dir models/calm \
+    --moe-dir "$MOE_DIR" \
+    --baked-train data/baked/eu8/train.pt \
+    --baked-val data/baked/eu8/val.pt \
+    --output "$OUTPUT" \
+    --epochs $EPOCHS \
+    --moe-lr $MOE_LR \
+    --head-lr $HEAD_LR \
+    --grad-accum $GRAD_ACCUM \
+    --no-compile \
+    --probe-budget \
+    --max-batch 8192 \
+    --log-interval 50
+
+echo ""
+echo "Done. Output: $OUTPUT"

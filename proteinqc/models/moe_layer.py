@@ -254,12 +254,10 @@ class MoEFFN(nn.Module):
         router_probs: torch.Tensor,
         top_indices: torch.Tensor,
     ) -> None:
-        """Switch Transformer load-balancing loss."""
+        """Switch Transformer load-balancing loss (all top-k assignments)."""
         N = self.num_experts
-        one_hot = F.one_hot(
-            top_indices.reshape(-1, self.top_k)[:, 0],
-            num_classes=N,
-        ).float()
+        flat_experts = top_indices.reshape(-1)
+        one_hot = F.one_hot(flat_experts, num_classes=N).float()
         f = one_hot.mean(dim=0)
         P = router_probs.reshape(-1, N).mean(dim=0)
 
